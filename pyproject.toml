@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-analyst"
+version = "0.1.0"
+description = "DART 기반 한국 상장사 분기 재무/리포트 분석 도구"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "lxml>=5.0",
+  "pandas>=2.0",
+  "plotly>=5.20",
+  "requests>=2.31",
+  "python-dateutil>=2.8",
+]
+
+[project.optional-dependencies]
+docs = ["pypdf>=4.0"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+stock-analyst = "stock_analyst.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["stock_analyst*"]
