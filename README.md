@@ -32,6 +32,8 @@ export DART_API_KEY='여기에_DART_API_KEY'
 
 `stock-analyst` 콘솔 스크립트를 설치하지 않아도 `python -m stock_analyst.cli run ...` 방식으로 동일하게 실행할 수 있습니다.
 
+> 실행 환경에서 `pip install`이 막히는 경우에도 `./scripts/run_stock_pipeline.sh`는 표준 라이브러리 기반 실행기를 사용하므로 바로 실행할 수 있습니다. 단, 이 경우 HTML 차트는 Plotly 인터랙티브 차트가 아니라 CSV 내용을 확인하기 위한 기본 HTML로 생성됩니다.
+
 ## 실행 후 확인할 파일
 
 종목별 결과는 기본적으로 `outputs/{종목코드}_{회사명}/` 아래에 저장됩니다.
