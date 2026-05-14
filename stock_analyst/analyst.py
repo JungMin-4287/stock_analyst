@@ -109,8 +109,13 @@ def _parse_backlog_value(snippet: str, hint_unit: str | None = None) -> tuple[fl
     """
     수주잔고 섹션 스니펫에서 잔고 금액을 추출.
 
-    DART 텍스트 추출 시 표 셀이 공백으로 분리되므로,
-    "합계" 또는 "수주잔고" 키워드 이후의 숫자를 우선 탐색.
+    DART 수주잔고 표 구조 (테이블 → 텍스트 추출 시):
+        품목  수주일  납기  수주총액  기납품액  수주잔고
+        ...
+        합계  -  -  [수주총액합]  [기납품합]  [수주잔고합]  ← 마지막 열이 수주잔고
+
+    핵심: 수주잔고 = 마지막 열 = 수주총액보다 작은 값.
+          max() 로 가져오면 수주총액이 걸린다 → WRONG.
     """
     multiplier_map = {
         "백만원": 0.01, "억원": 1.0, "천억원": 1000.0,
@@ -128,7 +133,7 @@ def _parse_backlog_value(snippet: str, hint_unit: str | None = None) -> tuple[fl
 
     mult = multiplier_map.get(hint_unit or "", 1.0)
 
-    # 명시적 단위 붙은 숫자 우선 (예: "35,000억원")
+    # ① 명시적 단위 붙은 숫자 (예: "35,000억원")
     m = re.search(r"([0-9,]{3,})\s*(백만원|억원|천억원|조원|원|천원)", snippet)
     if m:
         raw = m.group(1).replace(",", "")
@@ -138,40 +143,47 @@ def _parse_backlog_value(snippet: str, hint_unit: str | None = None) -> tuple[fl
         except ValueError:
             pass
 
-    # "합계" 또는 "계" 행 직후 숫자들에서 마지막 큰 값 (= 수주잔고 열)
-    agg_m = re.search(r"(?:합\s*계|소\s*계)\s+((?:[0-9,]+\s+)+)", snippet)
-    if agg_m and hint_unit:
-        nums = re.findall(r"[0-9,]{3,}", agg_m.group(1))
+    if not hint_unit:
+        return None, None
+
+    # ② "합계" / "계" 행 이후 숫자들 → 마지막 숫자 = 수주잔고 열
+    #    (텍스트 추출 시 "-" 나 날짜 등 비숫자 토큰이 섞여 있어 직접 숫자만 추출)
+    agg_m = re.search(r"(?:합\s*계|소\s*계)", snippet)
+    if agg_m:
+        after = snippet[agg_m.end(): agg_m.end() + 300]
+        nums = re.findall(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,}", after)
+        # 연도 제외 (4자리 19xx/20xx)
+        nums = [n for n in nums if not re.fullmatch(r"(?:19|20)\d{2}", n.replace(",", ""))]
         if nums:
             try:
+                # 마지막 값 = 수주잔고 열 (수주총액 → 기납품액 → 수주잔고 순서)
                 return float(nums[-1].replace(",", "")) * mult, hint_unit
             except ValueError:
                 pass
 
-    # "수주잔고" 컬럼명 이후 숫자들 중 마지막 값
-    col_m = re.search(r"수주\s*잔고\s+((?:[0-9,]+[\s\-]+)+)", snippet)
-    if col_m and hint_unit:
-        nums = re.findall(r"[0-9,]{3,}", col_m.group(1))
-        if nums:
-            try:
-                return float(nums[-1].replace(",", "")) * mult, hint_unit
-            except ValueError:
-                pass
+    # ③ "수주잔고" 헤더 이후 첫 번째 숫자 (단일 행 형태)
+    col_m = re.search(r"수주\s*잔고[^0-9]{0,30}([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})", snippet)
+    if col_m:
+        try:
+            return float(col_m.group(1).replace(",", "")) * mult, hint_unit
+        except ValueError:
+            pass
 
-    # 전체 스니펫에서 큰 숫자 fallback
-    if hint_unit:
-        nums = re.findall(r"\b([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})\b", snippet)
-        if nums:
-            # 연도처럼 생긴 4자리 숫자(1990~2099) 제외
-            candidates = [n.replace(",", "") for n in nums
-                          if not re.fullmatch(r"(?:19|20)\d{2}", n.replace(",", ""))]
-            if candidates:
-                # 가장 큰 숫자를 총 수주잔고로 추정
-                try:
-                    best = max(candidates, key=lambda x: int(x))
-                    return float(best) * mult, hint_unit
-                except ValueError:
-                    pass
+    # ④ 전체 스니펫에서 숫자 목록 수집 후 마지막-에서-두번째 값
+    #    (마지막 열 = 수주잔고, 그 직전 = 기납품액으로 가정)
+    nums_all = re.findall(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,}", snippet)
+    nums_all = [n for n in nums_all if not re.fullmatch(r"(?:19|20)\d{2}", n.replace(",", ""))]
+    if len(nums_all) >= 3:
+        # 마지막 숫자: 수주잔고 (가장 적은 값) — max 쓰지 말고 last 사용
+        try:
+            return float(nums_all[-1].replace(",", "")) * mult, hint_unit
+        except ValueError:
+            pass
+    elif nums_all:
+        try:
+            return float(nums_all[-1].replace(",", "")) * mult, hint_unit
+        except ValueError:
+            pass
 
     return None, None
 
