@@ -409,6 +409,7 @@ def load_data(
 def load_text_data(
     api_key: str,
     corp_code: str,
+    corp_name: str,
     start_date: str,
     end_date: str,
 ) -> dict:
@@ -428,7 +429,14 @@ def load_text_data(
         )
         try:
             text = client.document_text(filing.rcept_no)
-            bl = extract_order_backlog(text)
+            # 보고서 기간 레이블 (예: "2025-Q3") — 패턴 학습에 사용
+            period_label = filing.rcept_dt[:4] + "-" + filing.report_nm[:4]
+            bl = extract_order_backlog(
+                text,
+                corp_code=corp_code,
+                corp_name=corp_name,
+                period=period_label,
+            )
             ut = extract_utilization(text)
             pr = extract_product_revenue(text)
             for item in bl:
@@ -886,6 +894,7 @@ with tab_order:
                 text_result = load_text_data(
                     api_key=st.session_state["api_key"],
                     corp_code=company.corp_code,
+                    corp_name=company.corp_name,
                     start_date=f"{st.session_state['start_year']}0101",
                     end_date=f"{st.session_state['end_year']}1231",
                 )
@@ -1061,11 +1070,4 @@ with tab_data:
             "차입금(십억원)": "단기+장기차입금+사채 합계",
             "재고자산회전율(회/년)": "연환산 재고자산회전율",
             "매출채권회전율(회/년)": "연환산 매출채권회전율",
-            "재고일수(DIO, 일)": "365 / 재고자산회전율",
-            "매출채권회수일(DSO, 일)": "365 / 매출채권회전율",
-        }
-        desc_df = pd.DataFrame(
-            [{"컬럼명": k, "설명": v} for k, v in col_desc.items()
-             if k in display_full.columns]
-        )
-        st.dataframe(desc_df, use_container_width=True, height=300, hide_index=True)
+            "재고일수(
