@@ -2,9 +2,10 @@
 stock_analyst/analyst.py  ―  파생지표 계산 + 텍스트 기반 지표 추출
 
 주요 기능:
-  - derive_full_metrics()     : IS 분기 + BS 기말 합산 → 회전율 등 파생지표 계산
-  - extract_order_backlog()   : 수주잔고 / 기납품 수주잔고 텍스트 추출
-  - extract_utilization()     : 공장 가동율 텍스트 추출
+  - derive_full_metrics()       : IS 분기 + BS 기말 합산 → 회전율 등 파생지표 계산
+  - extract_order_backlog()     : 수주잔고 / 기납품 수주잔고 텍스트 추출
+  - extract_utilization()       : 공장 가동율 텍스트 추출
+  - extract_product_revenue()   : 제품별/부문별 매출 현황 텍스트 추출
 """
 
 from __future__ import annotations
@@ -104,75 +105,140 @@ def derive_full_metrics(
 
 # ── 텍스트 기반 지표 추출 ─────────────────────────────────────────
 
+def _parse_amount_in_snippet(snippet: str, hint_unit: str | None = None) -> tuple[float | None, str | None]:
+    """
+    스니펫에서 금액 숫자를 찾아 (값_억원, 단위문자열) 반환.
+    hint_unit: 표 단위 헤더에서 미리 파악된 단위 (예: "억원", "백만원")
+    """
+    multiplier_map = {
+        "백만원": 0.01, "억원": 1.0, "천억원": 1000.0,
+        "조원": 10000.0, "원": 1e-8,
+    }
+    # 단위가 표 헤더에 적혀 있는 경우 (예: "(단위 : 억원)")
+    if hint_unit is None:
+        unit_header = re.search(r"단위\s*[：:]\s*(백만원|억원|천억원|조원|원)", snippet)
+        if unit_header:
+            hint_unit = unit_header.group(1)
+
+    # 명시적 단위 붙은 숫자 우선
+    m = re.search(r"([0-9,]{3,})\s*(백만원|억원|천억원|조원|원)", snippet)
+    if m:
+        raw = m.group(1).replace(",", "")
+        unit = m.group(2)
+        try:
+            return float(raw) * multiplier_map.get(unit, 1.0), unit
+        except ValueError:
+            pass
+
+    # 단위 헤더 있고, 순수 숫자만 있는 경우 (표 셀 분리된 경우)
+    if hint_unit:
+        nums = re.findall(r"\b([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})\b", snippet)
+        if nums:
+            raw = nums[-1].replace(",", "")  # 마지막 큰 숫자 사용
+            try:
+                return float(raw) * multiplier_map.get(hint_unit, 1.0), hint_unit
+            except ValueError:
+                pass
+
+    return None, None
+
+
 def extract_order_backlog(text: str) -> list[dict[str, Any]]:
     """
     DART 보고서 원문에서 수주잔고 / 기납품 수주잔고 관련 문단을 추출.
+
+    DART HTML 표는 텍스트 추출 시 셀이 줄바꿈으로 분리되므로
+    "수주상황" 섹션 전체를 넓게 캡처하는 방식으로 탐지합니다.
+
     반환값: [{"label": str, "snippet": str, "parsed_value": float|None, "unit": str|None}, ...]
     """
     results: list[dict[str, Any]] = []
 
-    # ─ 패턴 1: 수주잔고 숫자 직접 파싱 ─
-    # 예) 수주잔고 : 1,234,567백만원  /  수주잔액 2,345억원
-    number_patterns = [
+    # ── 표 단위 헤더 파싱 (전체 텍스트에서 먼저 확인) ──
+    global_unit: str | None = None
+    unit_m = re.search(r"단위\s*[：:]\s*(?:천[㎡㎥]?\s*,\s*)?(백만원|억원|천억원|조원|원)", text)
+    if unit_m:
+        global_unit = unit_m.group(1)
+
+    # ── 섹션 헤더 탐지 (넓은 창으로 전체 섹션 캡처) ──
+    section_patterns = [
+        # "라. 수주상황", "마. 수주현황" 등 목차 형식
+        r"[가나다라마바사아자차카타파하]\.\s*수주[상황현황잔고]",
+        r"\d+\.\s*수주[상황현황잔고]",
+        r"수주\s*상황",
+        r"수주\s*현황",
+        r"수주잔고\s*현황",
+        r"Order\s*Backlog",
+        r"수주\s*실적",
+    ]
+    for pat in section_patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            start = max(0, m.start() - 50)
+            end = min(len(text), m.end() + 2000)   # 섹션 전체 캡처 (2000자)
+            block = text[start:end]
+            snippet = re.sub(r"\s+", " ", block).strip()
+
+            # 단위 파악 (로컬 우선, 없으면 전역)
+            local_unit_m = re.search(r"단위\s*[：:]\s*(?:천[㎡㎥]?\s*,\s*)?(백만원|억원|천억원|조원|원)", block)
+            hint = local_unit_m.group(1) if local_unit_m else global_unit
+
+            parsed, found_unit = _parse_amount_in_snippet(snippet, hint)
+            label = "기납품 수주잔고" if "기납품" in snippet[:300] else "수주잔고"
+            results.append({
+                "label": label,
+                "snippet": snippet[:1000],
+                "parsed_value": parsed,
+                "unit": found_unit or hint or "억원",
+            })
+
+    # ── 수주잔고 숫자 직접 패턴 (단위 명시된 경우) ──
+    inline_patterns = [
         r"수주잔고\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
         r"수주잔액\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
         r"잔여\s*수주\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
-        r"Order\s*Backlog\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원|KRW|billion|million)",
+        r"Order\s*Backlog\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
+        r"기납품\s*수주잔고\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
     ]
-    for pattern in number_patterns:
-        for m in re.finditer(pattern, text, re.IGNORECASE):
+    multiplier_map = {"백만원": 0.01, "억원": 1.0, "천억원": 1000.0, "조원": 10000.0, "원": 1e-8}
+    for pat in inline_patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
             raw = m.group(1).replace(",", "")
             unit = m.group(2)
             try:
-                val = float(raw)
-                # 억원 기준으로 통일
-                multiplier = {"백만원": 0.01, "억원": 1.0, "천억원": 1000.0, "조원": 10000.0, "원": 1e-8}
-                val_billion = val * multiplier.get(unit, 1.0)
+                val = float(raw) * multiplier_map.get(unit, 1.0)
             except ValueError:
-                val_billion = None
+                val = None
             start = max(0, m.start() - 200)
-            end = min(len(text), m.end() + 200)
-            results.append({
-                "label": "수주잔고",
-                "snippet": re.sub(r"\s+", " ", text[start:end]).strip(),
-                "parsed_value": val_billion,
-                "unit": "억원",
-            })
-
-    # ─ 패턴 2: 수주잔고 현황 테이블 전후 문맥 ─
-    context_keywords = [
-        "수주잔고 현황", "수주현황", "기납품 수주잔고", "수주잔고(기납품)",
-        "수주잔량", "잔여수주", "수주 잔고", "납품예정",
-    ]
-    for keyword in context_keywords:
-        for m in re.finditer(re.escape(keyword), text):
-            start = max(0, m.start() - 100)
-            end = min(len(text), m.end() + 800)
-            snippet = re.sub(r"\s+", " ", text[start:end]).strip()
-            label = "기납품 수주잔고" if "기납품" in keyword else "수주잔고"
-            # 숫자 파싱 시도
-            num_match = re.search(r"([0-9,]+)\s*(백만원|억원|조원|원)", snippet)
-            parsed = None
-            if num_match:
-                raw = num_match.group(1).replace(",", "")
-                unit = num_match.group(2)
-                multiplier = {"백만원": 0.01, "억원": 1.0, "조원": 10000.0, "원": 1e-8}
-                try:
-                    parsed = float(raw) * multiplier.get(unit, 1.0)
-                except ValueError:
-                    pass
+            end = min(len(text), m.end() + 300)
+            label = "기납품 수주잔고" if "기납품" in m.group(0) else "수주잔고"
             results.append({
                 "label": label,
-                "snippet": snippet[:600],
-                "parsed_value": parsed,
-                "unit": "억원" if parsed is not None else None,
+                "snippet": re.sub(r"\s+", " ", text[start:end]).strip(),
+                "parsed_value": val,
+                "unit": unit,
             })
 
-    # 중복 제거 (snippet 앞 100자 기준)
+    # ── 기납품 키워드 별도 탐지 ──
+    for m in re.finditer(r"기납품", text):
+        start = max(0, m.start() - 100)
+        end = min(len(text), m.end() + 600)
+        block = text[start:end]
+        snippet = re.sub(r"\s+", " ", block).strip()
+        local_unit_m = re.search(r"단위\s*[：:]\s*(?:천[㎡㎥]?\s*,\s*)?(백만원|억원|천억원|조원|원)", block)
+        hint = local_unit_m.group(1) if local_unit_m else global_unit
+        parsed, found_unit = _parse_amount_in_snippet(snippet, hint)
+        results.append({
+            "label": "기납품 수주잔고",
+            "snippet": snippet[:600],
+            "parsed_value": parsed,
+            "unit": found_unit or hint,
+        })
+
+    # 중복 제거
     seen: set[str] = set()
     deduped = []
     for item in results:
-        key = item["snippet"][:100]
+        key = item["snippet"][:120]
         if key not in seen:
             seen.add(key)
             deduped.append(item)
@@ -219,78 +285,4 @@ def extract_utilization(text: str) -> list[dict[str, Any]]:
             start = max(0, m.start() - 50)
             end = min(len(text), m.end() + 600)
             snippet = re.sub(r"\s+", " ", text[start:end]).strip()
-            pct_match = re.search(r"([0-9]+\.?[0-9]*)\s*%", snippet)
-            pct = None
-            if pct_match:
-                try:
-                    pct = float(pct_match.group(1))
-                except ValueError:
-                    pass
-            results.append({
-                "label": "공장 가동율",
-                "snippet": snippet[:600],
-                "parsed_pct": pct,
-            })
-
-    # 중복 제거
-    seen: set[str] = set()
-    deduped = []
-    for item in results:
-        key = item["snippet"][:100]
-        if key not in seen:
-            seen.add(key)
-            deduped.append(item)
-
-    return deduped[:10]
-
-
-# ── 컬럼 한글 레이블 매핑 ─────────────────────────────────────────
-
-COLUMN_LABELS: dict[str, str] = {
-    "period":              "분기",
-    "revenue":             "매출액(십억원)",
-    "cogs":                "매출원가(십억원)",
-    "gross_profit":        "매출총이익(십억원)",
-    "operating_profit":    "영업이익(십억원)",
-    "net_income":          "순이익(십억원)",
-    "opm":                 "OPM(%)",
-    "gpm":                 "GPM(%)",
-    "npm":                 "NPM(%)",
-    "cogs_ratio":          "원가비중(%)",
-    "inventory":           "재고자산(십억원)",
-    "accounts_receivable": "매출채권(십억원)",
-    "total_borrowings":    "차입금(십억원)",
-    "inventory_turnover":  "재고자산회전율(회/년)",
-    "ar_turnover":         "매출채권회전율(회/년)",
-    "dio":                 "재고일수(DIO, 일)",
-    "dso":                 "매출채권회수일(DSO, 일)",
-}
-
-# 표시할 때 십억원으로 변환이 필요한 컬럼
-BILLION_WON_COLS = {
-    "revenue", "cogs", "gross_profit", "operating_profit",
-    "net_income", "inventory", "accounts_receivable", "total_borrowings",
-}
-
-# 퍼센트로 표시할 컬럼
-PERCENT_COLS = {"opm", "gpm", "npm", "cogs_ratio"}
-
-
-def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    숫자 포맷 적용된 표시용 DataFrame 반환.
-    십억원 컬럼 → 소수점 1자리, 퍼센트 컬럼 → ×100 후 소수점 1자리
-    """
-    out = df.copy()
-    for col in df.columns:
-        if col in BILLION_WON_COLS and col in out.columns:
-            out[col] = (out[col] / 1_000_000_000).round(1)
-        elif col in PERCENT_COLS and col in out.columns:
-            out[col] = (out[col] * 100).round(1)
-        elif col in {"inventory_turnover", "ar_turnover"} and col in out.columns:
-            out[col] = out[col].round(2)
-        elif col in {"dio", "dso"} and col in out.columns:
-            out[col] = out[col].round(1)
-    # 컬럼명 한글로 치환
-    rename_map = {c: COLUMN_LABELS.get(c, c) for c in out.columns}
-    return out.rename(columns=rename_map)
+            pct_match = re.search(r"([0-9]+\.?[0-9]*)\s*%", snippe
