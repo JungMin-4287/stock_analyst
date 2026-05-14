@@ -322,6 +322,19 @@ def normalize_cumulative_financials(
     """
     (year, reprt_code, DataFrame) 리스트에서 IS 누적 데이터를 추출해
     period_label × metric 형태로 반환.
+
+    DART 분기보고서 금액 필드 구분
+    ────────────────────────────────────────────────────────────────
+    분기보고서(11013/11014)의 손익계산서:
+      thstrm_amount     : 당해 분기 3개월 단독 금액   ← Q1·Q3 단독값
+      thstrm_add_amount : 당해 사업연도 누적 금액     ← Q1 누적 = Q1,
+                                                        Q3 누적 = Q1+Q2+Q3
+    반기보고서(11012):
+      thstrm_amount     : 반기(1~6월) 누적 금액
+    사업보고서(11011):
+      thstrm_amount     : 연간 전체 금액
+
+    Q4 차감 계산이 올바르려면 Q3에는 반드시 누적값(thstrm_add_amount)을 써야 한다.
     """
     records: list[dict] = []
     for year, reprt_code, frame in frames:
@@ -330,11 +343,22 @@ def normalize_cumulative_financials(
         income = frame[
             frame.get("sj_div", pd.Series(dtype=str)).isin(["IS", "CIS"])
         ]
+        report_period = REPORT_CODES.get(reprt_code, "")
         for _, row in income.iterrows():
             metric = _match_account(row)
             if not metric:
                 continue
-            amount = _to_number(row.get("thstrm_amount"))
+
+            # Q3(11014) 는 thstrm_add_amount(누적) 우선 사용
+            # Q1(11013) 도 add_amount 가 있으면 사용 (없으면 thstrm_amount 와 동일)
+            if report_period in ("Q1", "Q3"):
+                amount = _to_number(row.get("thstrm_add_amount"))
+                if amount is None:
+                    amount = _to_number(row.get("thstrm_amount"))
+            else:
+                # H1(반기), FY(사업보고서): thstrm_amount 가 이미 누적값
+                amount = _to_number(row.get("thstrm_amount"))
+
             if amount is None:
                 continue
             records.append(
