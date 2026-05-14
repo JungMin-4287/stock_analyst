@@ -247,6 +247,7 @@ def extract_order_backlog(
     corp_code: str = "",
     corp_name: str = "",
     period: str = "",
+    llm_api_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     DART 보고서 원문에서 수주잔고 관련 정보를 추출.
@@ -262,7 +263,10 @@ def extract_order_backlog(
     반환값: [{"label": str, "snippet": str, "parsed_value": float|None, "unit": str|None}, ...]
     """
     if _probe_backlog is not None:
-        raw = _probe_backlog(text, corp_code=corp_code, corp_name=corp_name, period=period)
+        raw = _probe_backlog(
+            text, corp_code=corp_code, corp_name=corp_name,
+            period=period, llm_api_key=llm_api_key,
+        )
         # _debug 키 제거 (공개 API 호환)
         return [
             {k: v for k, v in item.items() if k != "_debug"}
