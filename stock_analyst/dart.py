@@ -394,6 +394,7 @@ def normalize_cumulative_financials(
                     "currency": row.get("currency") or "KRW",
                     "fs_div": row.get("fs_div"),
                     "fs_nm": row.get("fs_nm"),
+                    "sj_div": row.get("sj_div", ""),  # CIS/IS 구분 저장 (dedup 우선순위용)
                     "account_nm": row.get("account_nm"),
                     "account_id": row.get("account_id"),
                     "ordinal": row.get("ord"),
@@ -402,12 +403,16 @@ def normalize_cumulative_financials(
     if not records:
         return pd.DataFrame()
     df = pd.DataFrame(records)
+    # CIS 우선순위를 최종 sort에도 반영
+    # (루프 내 sort는 iteration 순서만 바꾸므로 외부 sort_values가 덮어씌움 → 버그)
+    _SJ_PRIO_MAP = {"CIS": 0, "IS": 1}
+    df["_sj_prio"] = df["sj_div"].map(_SJ_PRIO_MAP).fillna(2).astype(int)
     df["ordinal_num"] = pd.to_numeric(df["ordinal"], errors="coerce")
     df = df.sort_values(
-        ["year", "reprt_code", "metric", "ordinal_num"], na_position="last"
+        ["year", "reprt_code", "metric", "_sj_prio", "ordinal_num"], na_position="last"
     )
     return df.drop_duplicates(["period_label", "metric"], keep="first").drop(
-        columns=["ordinal_num"]
+        columns=["ordinal_num", "_sj_prio"], errors="ignore"
     )
 
 
