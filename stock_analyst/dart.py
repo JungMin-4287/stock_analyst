@@ -484,5 +484,80 @@ def derive_quarterly_metrics(cumulative: pd.DataFrame) -> pd.DataFrame:
             rp: str = row["report_period"]   # "Q1" | "H1" | "Q3" | "FY"
             quarter: int = _REPORT_TO_QUARTER[rp]
 
+
             rec: dict = {
-       
+                "year": int(year),
+                "quarter": quarter,
+                "period": f"{int(year)}Q{quarter}",
+                "data_source": f"{rp} - {prev_label}" if prev_label != "연초" else rp,
+            }
+
+            for m in metric_cols:
+                cum_val = row.get(m)
+                if pd.isna(cum_val):
+                    rec[m] = float("nan")
+                    continue
+                cum_val = float(cum_val)
+                rec[m] = cum_val - prev_cum[m]
+                prev_cum[m] = cum_val
+
+            prev_label = rp
+            records.append(rec)
+
+    if not records:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(records)
+
+    # 마진율 계산
+    if "revenue" in out.columns:
+        rev = out["revenue"].replace(0, float("nan"))
+        if "operating_profit" in out.columns:
+            out["opm"] = out["operating_profit"] / rev
+        if "gross_profit" in out.columns:
+            out["gpm"] = out["gross_profit"] / rev
+        if "net_income" in out.columns:
+            out["npm"] = out["net_income"] / rev
+        if "cogs" in out.columns:
+            out["cogs_ratio"] = out["cogs"] / rev
+
+    # cogs 없을 경우 gross_profit 역산
+    if "cogs" not in out.columns and "gross_profit" in out.columns and "revenue" in out.columns:
+        out["cogs"] = out["revenue"] - out["gross_profit"]
+        out["cogs_ratio"] = out["cogs"] / out["revenue"].replace(0, float("nan"))
+
+    return out
+
+
+# -- 텍스트 추출 --
+
+def extract_revenue_note_candidates(text: str) -> list[str]:
+    import re
+    keywords = ("매출처", "주요 고객", "주요 매출", "매출실적", "영업부문", "제품별", "지역별")
+    blocks = re.split(r"\n{2,}|(?=\d+\.\s)", text)
+    candidates = []
+    for block in blocks:
+        if any(keyword in block for keyword in keywords) and (
+            "매출" in block or "수익" in block
+        ):
+            compact = re.sub(r"\s+", " ", block).strip()
+            if 60 <= len(compact) <= 3000:
+                candidates.append(compact)
+    return candidates[:20]
+
+
+def write_filings_csv(filings, output: Path) -> None:
+    from dataclasses import asdict
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([asdict(f) for f in filings]).to_csv(
+        output, index=False, encoding="utf-8-sig"
+    )
+
+
+def write_company_json(company, output: Path) -> None:
+    from dataclasses import asdict
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(asdict(company), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
