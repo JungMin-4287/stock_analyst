@@ -336,13 +336,24 @@ def normalize_cumulative_financials(
 
     Q4 차감 계산이 올바르려면 Q3에는 반드시 누적값(thstrm_add_amount)을 써야 한다.
     """
+    # 연결(CFS) 보고서에서 IS 계정 우선순위: CIS > IS
+    # (일부 반기보고서는 CIS+IS 가 혼재하며 IS 가 부분 과목일 수 있음)
+    _SJ_PRIORITY = {"CIS": 0, "IS": 1}  # CIS 가 더 높은 우선순위
+
     records: list[dict] = []
     for year, reprt_code, frame in frames:
         if frame.empty:
             continue
-        income = frame[
+        income_raw = frame[
             frame.get("sj_div", pd.Series(dtype=str)).isin(["IS", "CIS"])
-        ]
+        ].copy()
+        if income_raw.empty:
+            continue
+        # sj_div 우선순위 컬럼 추가 후 정렬 (CIS 행이 IS 행보다 앞에 오도록)
+        income_raw["_sj_prio"] = income_raw.get(
+            "sj_div", pd.Series("", index=income_raw.index)
+        ).map(_SJ_PRIORITY).fillna(2).astype(int)
+        income = income_raw.sort_values("_sj_prio").drop(columns=["_sj_prio"])
         report_period = REPORT_CODES.get(reprt_code, "")
         for _, row in income.iterrows():
             metric = _match_account(row)
