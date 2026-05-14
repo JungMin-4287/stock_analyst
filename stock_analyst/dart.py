@@ -349,14 +349,25 @@ def normalize_cumulative_financials(
             if not metric:
                 continue
 
-            # Q3(11014) 는 thstrm_add_amount(누적) 우선 사용
-            # Q1(11013) 도 add_amount 가 있으면 사용 (없으면 thstrm_amount 와 동일)
-            if report_period in ("Q1", "Q3"):
-                amount = _to_number(row.get("thstrm_add_amount"))
-                if amount is None:
-                    amount = _to_number(row.get("thstrm_amount"))
+            # DART 분기보고서 금액 필드 선택 전략
+            # ─────────────────────────────────────────────────────
+            # Q3(11014): thstrm_amount = 3개월 단독 / thstrm_add_amount = 9개월 누적
+            #            → add_amount 가 있고 abs(add_amount) >= abs(thstrm_amount) 이면 누적으로 판단
+            #            → 없거나 작으면 thstrm_amount 사용 (일부 회사는 thstrm_amount 가 이미 누적)
+            # Q1(11013): 둘 다 1분기 값이므로 동일. thstrm_amount 우선
+            # H1(11012) / FY(11011): thstrm_amount 가 이미 누적값
+            if report_period == "Q3":
+                add_amt  = _to_number(row.get("thstrm_add_amount"))
+                term_amt = _to_number(row.get("thstrm_amount"))
+                if add_amt is not None and term_amt is not None:
+                    # 절댓값 기준: add_amount >= thstrm_amount → 누적으로 판단
+                    amount = add_amt if abs(add_amt) >= abs(term_amt) else term_amt
+                elif add_amt is not None:
+                    amount = add_amt
+                else:
+                    amount = term_amt
             else:
-                # H1(반기), FY(사업보고서): thstrm_amount 가 이미 누적값
+                # Q1·H1·FY 는 thstrm_amount 사용 (이미 누적 또는 전체)
                 amount = _to_number(row.get("thstrm_amount"))
 
             if amount is None:
