@@ -15,6 +15,11 @@ from typing import Any
 
 import pandas as pd
 
+try:
+    from .backlog_probe import probe_backlog as _probe_backlog
+except ImportError:
+    _probe_backlog = None  # type: ignore
+
 
 # ── 전체 지표 통합 ────────────────────────────────────────────────
 
@@ -237,108 +242,58 @@ def _parse_amount_in_snippet(snippet: str, hint_unit: str | None = None) -> tupl
     return None, None
 
 
-def extract_order_backlog(text: str) -> list[dict[str, Any]]:
+def extract_order_backlog(
+    text: str,
+    corp_code: str = "",
+    corp_name: str = "",
+    period: str = "",
+) -> list[dict[str, Any]]:
     """
-    DART 보고서 원문에서 수주잔고 / 기납품 수주잔고 관련 문단을 추출.
+    DART 보고서 원문에서 수주잔고 관련 정보를 추출.
 
-    DART HTML 표는 텍스트 추출 시 셀이 줄바꿈으로 분리되므로
-    "수주상황" 섹션 전체를 넓게 캡처하는 방식으로 탐지합니다.
+    backlog_probe.probe_backlog() 에 위임:
+      - 섹션 헤딩 패턴 (광범위 목록)
+      - 수주총액 키워드 기반 exhaustive 스캔
+      - 수주잔고 = 수주총액 - 기납품액 triple 검증
+      - 검증 성공 시 회사별 패턴 캐시(data/learned_patterns.json) 저장
+
+    corp_code / corp_name / period 를 전달하면 학습 결과가 저장됩니다.
 
     반환값: [{"label": str, "snippet": str, "parsed_value": float|None, "unit": str|None}, ...]
     """
-    results: list[dict[str, Any]] = []
+    if _probe_backlog is not None:
+        raw = _probe_backlog(text, corp_code=corp_code, corp_name=corp_name, period=period)
+        # _debug 키 제거 (공개 API 호환)
+        return [
+            {k: v for k, v in item.items() if k != "_debug"}
+            for item in raw
+        ]
 
-    # ── 표 단위 헤더 파싱 (전체 텍스트에서 먼저 확인) ──
+    # ── fallback: backlog_probe 없을 때 기존 로직 유지 ──
+    results: list[dict[str, Any]] = []
     global_unit: str | None = None
     unit_m = re.search(r"단위\s*[：:]\s*(?:천[㎡㎥]?\s*,\s*)?(백만원|억원|천억원|조원|원)", text)
     if unit_m:
         global_unit = unit_m.group(1)
-
-    # ── 섹션 헤더 탐지 (넓은 창으로 전체 섹션 캡처) ──
-    section_patterns = [
-        # "라. 수주상황", "가. 수주잔고" 등 목차 하위 항목
+    FALLBACK_PATS = [
         r"[가나다라마바사아자차카타파하]\.\s*수주[상황현황잔고]",
-        # "4. 수주상황", "4. 수주현황"
         r"\d+\.\s*수주[상황현황잔고실적]",
-        # ★ "4. 매출 및 수주상황" — DART 빈출 헤딩 (대명에너지 등)
-        r"\d+\.\s*매출\s*(?:및\s*)?수주[상황현황]",
-        r"매출\s*및\s*수주[상황현황]",
-        # 단독 키워드
-        r"수주\s*상황",
-        r"수주\s*현황",
-        r"수주잔고\s*현황",
-        r"Order\s*Backlog",
-        r"수주\s*실적",
-        r"수주\s*잔고",
+        r"수주\s*상황", r"수주\s*현황", r"수주\s*잔고",
     ]
-    for pat in section_patterns:
+    for pat in FALLBACK_PATS:
         for m in re.finditer(pat, text, re.IGNORECASE):
             start = max(0, m.start() - 50)
-            end = min(len(text), m.end() + 3000)   # 섹션 전체 캡처 (3000자)
+            end = min(len(text), m.end() + 3000)
             block = text[start:end]
             snippet = re.sub(r"\s+", " ", block).strip()
-
-            # 단위 파악 (로컬 우선, 없으면 전역)
-            local_unit_m = re.search(
-                r"단위\s*[：:\s]\s*(?:천[㎡㎥]?\s*[,，]\s*)?(백만원|억원|천억원|조원|원|천원)",
-                block
-            )
-            hint = local_unit_m.group(1) if local_unit_m else global_unit
-
-            # 합계/잔고 행에서 마지막 큰 수치 우선 파싱
+            lu_m = re.search(r"단위\s*[：:\s]\s*(백만원|억원|천억원|조원|원|천원)", block)
+            hint = lu_m.group(1) if lu_m else global_unit
             parsed, found_unit = _parse_backlog_value(snippet, hint)
             label = "기납품 수주잔고" if "기납품" in snippet[:400] else "수주잔고"
             results.append({
-                "label": label,
-                "snippet": snippet[:1200],
-                "parsed_value": parsed,
-                "unit": found_unit or hint or "억원",
+                "label": label, "snippet": snippet[:1200],
+                "parsed_value": parsed, "unit": found_unit or hint or "억원",
             })
-
-    # ── 수주잔고 숫자 직접 패턴 (단위 명시된 경우) ──
-    inline_patterns = [
-        r"수주잔고\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
-        r"수주잔액\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
-        r"잔여\s*수주\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
-        r"Order\s*Backlog\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
-        r"기납품\s*수주잔고\s*[:\s]*([0-9,]+)\s*(백만원|억원|천억원|조원|원)",
-    ]
-    multiplier_map = {"백만원": 0.01, "억원": 1.0, "천억원": 1000.0, "조원": 10000.0, "원": 1e-8}
-    for pat in inline_patterns:
-        for m in re.finditer(pat, text, re.IGNORECASE):
-            raw = m.group(1).replace(",", "")
-            unit = m.group(2)
-            try:
-                val = float(raw) * multiplier_map.get(unit, 1.0)
-            except ValueError:
-                val = None
-            start = max(0, m.start() - 200)
-            end = min(len(text), m.end() + 300)
-            label = "기납품 수주잔고" if "기납품" in m.group(0) else "수주잔고"
-            results.append({
-                "label": label,
-                "snippet": re.sub(r"\s+", " ", text[start:end]).strip(),
-                "parsed_value": val,
-                "unit": unit,
-            })
-
-    # ── 기납품 키워드 별도 탐지 ──
-    for m in re.finditer(r"기납품", text):
-        start = max(0, m.start() - 100)
-        end = min(len(text), m.end() + 600)
-        block = text[start:end]
-        snippet = re.sub(r"\s+", " ", block).strip()
-        local_unit_m = re.search(r"단위\s*[：:]\s*(?:천[㎡㎥]?\s*,\s*)?(백만원|억원|천억원|조원|원)", block)
-        hint = local_unit_m.group(1) if local_unit_m else global_unit
-        parsed, found_unit = _parse_amount_in_snippet(snippet, hint)
-        results.append({
-            "label": "기납품 수주잔고",
-            "snippet": snippet[:600],
-            "parsed_value": parsed,
-            "unit": found_unit or hint,
-        })
-
-    # 중복 제거
     seen: set[str] = set()
     deduped = []
     for item in results:
@@ -346,7 +301,6 @@ def extract_order_backlog(text: str) -> list[dict[str, Any]]:
         if key not in seen:
             seen.add(key)
             deduped.append(item)
-
     return deduped[:15]
 
 
@@ -498,4 +452,5 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].round(2)
         elif col in {"dio", "dso"} and col in out.columns:
             out[col] = out[col].round(1)
-    rename_map 
+    rename_map = {c: COLUMN_LABELS.get(c, c) for c in out.columns}
+    return out.rename(columns=rename_map)
