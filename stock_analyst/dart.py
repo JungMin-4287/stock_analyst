@@ -1,3 +1,14 @@
+"""
+stock_analyst/dart.py  ―  DART OpenAPI 연동 모듈 (업데이트 버전)
+
+변경 내역:
+  - ACCOUNT_ALIASES 에 cogs(매출원가) 추가
+  - BS_ACCOUNT_ALIASES 추가 (재고자산, 매출채권, 차입금 계열)
+  - _match_bs_account() 추가
+  - normalize_bs_financials() 추가
+  - 기존 함수/클래스는 모두 동일하게 유지 (하위호환)
+"""
+
 from __future__ import annotations
 
 import io
@@ -18,23 +29,77 @@ from bs4 import BeautifulSoup
 from .models import Company, Filing
 
 DART_BASE = "https://opendart.fss.or.kr/api"
+
 REPORT_CODES = {
     "11013": "Q1",
     "11012": "H1",
     "11014": "Q3",
     "11011": "FY",
 }
-PERIOD_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+
+# 보고서 코드 → 분기 번호 매핑
+PERIOD_ORDER = {"Q1": 1, "H1": 2, "Q3": 3, "FY": 4}
+
+# ── 손익계산서(IS/CIS) 계정 ──────────────────────────────────────
 ACCOUNT_ALIASES = {
-    "revenue": ("매출액", "수익(매출액)", "영업수익", "영업수익(매출액)", "Revenue"),
-    "gross_profit": ("매출총이익", "Gross profit"),
-    "operating_profit": ("영업이익", "영업이익(손실)", "영업손익", "Profit (loss) from operating activities"),
-    "net_income": ("당기순이익", "당기순이익(손실)", "분기순이익", "반기순이익", "Profit (loss)"),
+    "revenue": (
+        "매출액", "수익(매출액)", "영업수익", "영업수익(매출액)", "Revenue",
+        "매출", "순매출액",
+    ),
+    "cogs": (
+        "매출원가", "Cost of sales", "영업비용(매출원가)",
+        "매출원가(영업비용)", "영업비용",
+    ),
+    "gross_profit": (
+        "매출총이익", "Gross profit", "매출총손익",
+    ),
+    "operating_profit": (
+        "영업이익", "영업이익(손실)", "영업손익",
+        "Profit (loss) from operating activities",
+    ),
+    "net_income": (
+        "당기순이익", "당기순이익(손실)", "분기순이익", "반기순이익",
+        "Profit (loss)", "당기순손익",
+    ),
+}
+
+# ── 재무상태표(BS) 계정 ──────────────────────────────────────────
+BS_ACCOUNT_ALIASES = {
+    "inventory": (
+        "재고자산", "Inventories", "재고자산합계",
+    ),
+    "accounts_receivable": (
+        "매출채권", "매출채권 및 기타유동채권", "매출채권 및 기타채권",
+        "Trade and other receivables", "매출채권 및 기타수취채권",
+        "Trade receivables", "매출채권(순액)",
+    ),
+    "short_term_borrowings": (
+        "단기차입금", "Short-term borrowings", "단기차입금 및 유동성장기부채",
+    ),
+    "long_term_borrowings": (
+        "장기차입금", "Long-term borrowings",
+    ),
+    "bonds_payable": (
+        "사채", "Bonds payable", "장기사채",
+    ),
+    "current_lt_debt": (
+        "유동성장기부채", "유동성장기차입금",
+        "Current portion of long-term borrowings",
+    ),
+    # 일부 기업은 차입금 합계를 직접 제공하기도 함
+    "total_borrowings_direct": (
+        "차입금", "총차입금",
+    ),
 }
 
 
 class DartClient:
-    def __init__(self, api_key: str, cache_dir: str | Path = ".cache/dart", sleep_seconds: float = 0.15):
+    def __init__(
+        self,
+        api_key: str,
+        cache_dir: str | Path = ".cache/dart",
+        sleep_seconds: float = 0.15,
+    ):
         self.api_key = api_key
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -44,17 +109,25 @@ class DartClient:
     def _get_json(self, endpoint: str, **params: str) -> dict:
         time.sleep(self.sleep_seconds)
         payload = {"crtfc_key": self.api_key, **params}
-        response = self.session.get(f"{DART_BASE}/{endpoint}", params=payload, timeout=30)
+        response = self.session.get(
+            f"{DART_BASE}/{endpoint}", params=payload, timeout=30
+        )
         response.raise_for_status()
         data = response.json()
         if data.get("status") not in {"000", "013"}:
-            raise RuntimeError(f"DART API error {data.get('status')}: {data.get('message')}")
+            raise RuntimeError(
+                f"DART API error {data.get('status')}: {data.get('message')}"
+            )
         return data
 
     def load_companies(self, force: bool = False) -> list[Company]:
         cache_file = self.cache_dir / "corpCode.xml"
         if force or not cache_file.exists():
-            response = self.session.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": self.api_key}, timeout=60)
+            response = self.session.get(
+                f"{DART_BASE}/corpCode.xml",
+                params={"crtfc_key": self.api_key},
+                timeout=60,
+            )
             response.raise_for_status()
             with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
                 cache_file.write_bytes(zf.read("CORPCODE.xml"))
@@ -71,21 +144,39 @@ class DartClient:
             )
         return companies
 
-    def find_company(self, corp_name: str | None = None, stock_code: str | None = None) -> Company:
+    def find_company(
+        self,
+        corp_name: str | None = None,
+        stock_code: str | None = None,
+    ) -> Company:
         if not corp_name and not stock_code:
             raise ValueError("corp_name or stock_code is required")
         matches = self.load_companies()
         if corp_name:
-            matches = [c for c in matches if c.corp_name == corp_name or corp_name in c.corp_name]
+            matches = [
+                c for c in matches
+                if c.corp_name == corp_name or corp_name in c.corp_name
+            ]
         if stock_code:
             matches = [c for c in matches if c.stock_code == stock_code]
         listed = [c for c in matches if c.stock_code]
         if not listed:
-            raise ValueError(f"No listed DART company matched corp_name={corp_name!r}, stock_code={stock_code!r}")
-        listed.sort(key=lambda c: (c.corp_name != corp_name if corp_name else False, c.stock_code))
+            raise ValueError(
+                f"No listed DART company matched "
+                f"corp_name={corp_name!r}, stock_code={stock_code!r}"
+            )
+        listed.sort(
+            key=lambda c: (c.corp_name != corp_name if corp_name else False, c.stock_code)
+        )
         return listed[0]
 
-    def filings(self, corp_code: str, start: str, end: str, final_only: bool = True) -> list[Filing]:
+    def filings(
+        self,
+        corp_code: str,
+        start: str,
+        end: str,
+        final_only: bool = True,
+    ) -> list[Filing]:
         page_no = 1
         rows: list[Filing] = []
         while True:
@@ -101,7 +192,10 @@ class DartClient:
             )
             for item in data.get("list", []):
                 report_nm = item.get("report_nm", "")
-                if any(keyword in report_nm for keyword in ("분기보고서", "반기보고서", "사업보고서")):
+                if any(
+                    kw in report_nm
+                    for kw in ("분기보고서", "반기보고서", "사업보고서")
+                ):
                     rows.append(
                         Filing(
                             corp_code=item.get("corp_code", ""),
@@ -120,7 +214,13 @@ class DartClient:
             page_no += 1
         return rows
 
-    def financial_statement_all(self, corp_code: str, year: int, reprt_code: str, fs_div: str = "CFS") -> pd.DataFrame:
+    def financial_statement_all(
+        self,
+        corp_code: str,
+        year: int,
+        reprt_code: str,
+        fs_div: str = "CFS",
+    ) -> pd.DataFrame:
         data = self._get_json(
             "fnlttSinglAcntAll.json",
             corp_code=corp_code,
@@ -150,12 +250,14 @@ class DartClient:
         return soup.get_text("\n", strip=True)
 
 
+# ── 내부 유틸 ────────────────────────────────────────────────────
+
 def period_from_report_code(year: int, reprt_code: str) -> str:
     return f"{year}-{REPORT_CODES[reprt_code]}"
 
 
 def _to_number(value: object) -> float | None:
-    if value is None or pd.isna(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     text = str(value).replace(",", "").replace(" ", "").strip()
     if text in {"", "-"}:
@@ -169,26 +271,65 @@ def _to_number(value: object) -> float | None:
 
 
 def _match_account(row: pd.Series) -> str | None:
+    """손익계산서(IS) 계정명 → 내부 metric 이름 매핑."""
     account_nm = str(row.get("account_nm", ""))
     account_id = str(row.get("account_id", ""))
     for metric, aliases in ACCOUNT_ALIASES.items():
-        if account_nm in aliases or any(alias.lower() == account_nm.lower() for alias in aliases):
+        if account_nm in aliases or any(
+            alias.lower() == account_nm.lower() for alias in aliases
+        ):
             return metric
+    # account_id 기반 fallback
     if "Revenue" in account_id and "Cost" not in account_id:
         return "revenue"
     if "GrossProfit" in account_id:
         return "gross_profit"
     if "Operating" in account_id and "Profit" in account_id:
         return "operating_profit"
+    if "CostOfSales" in account_id or "CostOfGoodsSold" in account_id:
+        return "cogs"
     return None
 
 
-def normalize_cumulative_financials(frames: Iterable[tuple[int, str, pd.DataFrame]]) -> pd.DataFrame:
+def _match_bs_account(row: pd.Series) -> str | None:
+    """재무상태표(BS) 계정명 → 내부 metric 이름 매핑."""
+    account_nm = str(row.get("account_nm", ""))
+    account_id = str(row.get("account_id", ""))
+    for metric, aliases in BS_ACCOUNT_ALIASES.items():
+        if account_nm in aliases or any(
+            alias.lower() == account_nm.lower() for alias in aliases
+        ):
+            return metric
+    # account_id 기반 fallback
+    if "Inventories" in account_id:
+        return "inventory"
+    if "TradeReceivables" in account_id or "TradeAndOtherReceivables" in account_id:
+        return "accounts_receivable"
+    if "ShortTermBorrowings" in account_id:
+        return "short_term_borrowings"
+    if "LongTermBorrowings" in account_id:
+        return "long_term_borrowings"
+    if "BondsPayable" in account_id or "Bonds" in account_id:
+        return "bonds_payable"
+    return None
+
+
+# ── IS 누적 데이터 정규화 ─────────────────────────────────────────
+
+def normalize_cumulative_financials(
+    frames: Iterable[tuple[int, str, pd.DataFrame]],
+) -> pd.DataFrame:
+    """
+    (year, reprt_code, DataFrame) 리스트에서 IS 누적 데이터를 추출해
+    period_label × metric 형태로 반환.
+    """
     records: list[dict] = []
     for year, reprt_code, frame in frames:
         if frame.empty:
             continue
-        income = frame[frame.get("sj_div", pd.Series(dtype=str)).isin(["IS", "CIS"])]
+        income = frame[
+            frame.get("sj_div", pd.Series(dtype=str)).isin(["IS", "CIS"])
+        ]
         for _, row in income.iterrows():
             metric = _match_account(row)
             if not metric:
@@ -216,48 +357,143 @@ def normalize_cumulative_financials(frames: Iterable[tuple[int, str, pd.DataFram
         return pd.DataFrame()
     df = pd.DataFrame(records)
     df["ordinal_num"] = pd.to_numeric(df["ordinal"], errors="coerce")
-    df = df.sort_values(["year", "reprt_code", "metric", "ordinal_num"], na_position="last")
-    return df.drop_duplicates(["period_label", "metric"], keep="first").drop(columns=["ordinal_num"])
+    df = df.sort_values(
+        ["year", "reprt_code", "metric", "ordinal_num"], na_position="last"
+    )
+    return df.drop_duplicates(["period_label", "metric"], keep="first").drop(
+        columns=["ordinal_num"]
+    )
 
+
+# ── BS 시점 데이터 정규화 (신규) ──────────────────────────────────
+
+def normalize_bs_financials(
+    frames: Iterable[tuple[int, str, pd.DataFrame]],
+) -> pd.DataFrame:
+    """
+    (year, reprt_code, DataFrame) 리스트에서 BS 기말 잔액을 추출해
+    period × metric 형태로 반환.
+    BS 항목은 누적값이 아닌 시점 잔액이므로 차감 계산 불필요.
+    """
+    records: list[dict] = []
+    for year, reprt_code, frame in frames:
+        if frame.empty:
+            continue
+        bs = frame[frame.get("sj_div", pd.Series(dtype=str)) == "BS"]
+        quarter = PERIOD_ORDER[REPORT_CODES[reprt_code]]
+        period = f"{year}Q{quarter}"
+        for _, row in bs.iterrows():
+            metric = _match_bs_account(row)
+            if not metric:
+                continue
+            amount = _to_number(row.get("thstrm_amount"))
+            if amount is None:
+                continue
+            records.append(
+                {
+                    "year": year,
+                    "reprt_code": reprt_code,
+                    "period": period,
+                    "metric": metric,
+                    "amount": amount,
+                    "account_nm": row.get("account_nm"),
+                    "account_id": row.get("account_id"),
+                    "ordinal": row.get("ord"),
+                }
+            )
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    df["ordinal_num"] = pd.to_numeric(df["ordinal"], errors="coerce")
+    df = df.sort_values(
+        ["year", "reprt_code", "metric", "ordinal_num"], na_position="last"
+    )
+    return df.drop_duplicates(["period", "metric"], keep="first").drop(
+        columns=["ordinal_num"]
+    )
+
+
+# ── IS 분기 파생 ──────────────────────────────────────────────────
 
 def derive_quarterly_metrics(cumulative: pd.DataFrame) -> pd.DataFrame:
+    """
+    누적 IS 데이터에서 분기값을 차감해 실제 분기 실적 DataFrame을 반환.
+    FY 값 = Q4 분기값으로 환산 (FY - Q3 누적).
+    """
     if cumulative.empty:
         return cumulative
-    pivot = cumulative.pivot_table(index=["year", "report_period"], columns="metric", values="amount", aggfunc="first").reset_index()
+
     report_to_quarter = {"Q1": 1, "H1": 2, "Q3": 3, "FY": 4}
+    pivot = (
+        cumulative.pivot_table(
+            index=["year", "report_period"],
+            columns="metric",
+            values="amount",
+            aggfunc="first",
+        )
+        .reset_index()
+    )
     pivot["quarter"] = pivot["report_period"].map(report_to_quarter)
     pivot = pivot.sort_values(["year", "quarter"])
-    metric_cols = [c for c in ["revenue", "gross_profit", "operating_profit", "net_income"] if c in pivot.columns]
+
+    metric_cols = [
+        c for c in ["revenue", "cogs", "gross_profit", "operating_profit", "net_income"]
+        if c in pivot.columns
+    ]
     out = pivot[["year", "quarter"]].copy()
     out["period"] = out["year"].astype(str) + "Q" + out["quarter"].astype(str)
+
     for metric in metric_cols:
         out[metric] = pivot.groupby("year")[metric].diff().fillna(pivot[metric])
-    if {"operating_profit", "revenue"}.issubset(out.columns):
-        out["opm"] = out["operating_profit"] / out["revenue"]
-    if {"gross_profit", "revenue"}.issubset(out.columns):
-        out["gpm"] = out["gross_profit"] / out["revenue"]
-    if {"net_income", "revenue"}.issubset(out.columns):
-        out["npm"] = out["net_income"] / out["revenue"]
+
+    # 마진율 계산
+    revenue = out.get("revenue")
+    if revenue is not None:
+        if "operating_profit" in out.columns:
+            out["opm"] = out["operating_profit"] / revenue
+        if "gross_profit" in out.columns:
+            out["gpm"] = out["gross_profit"] / revenue
+        if "net_income" in out.columns:
+            out["npm"] = out["net_income"] / revenue
+        if "cogs" in out.columns:
+            out["cogs_ratio"] = out["cogs"] / revenue
+
+    # cogs 없을 경우 gross_profit으로 역산
+    if "cogs" not in out.columns and "gross_profit" in out.columns and "revenue" in out.columns:
+        out["cogs"] = out["revenue"] - out["gross_profit"]
+        out["cogs_ratio"] = out["cogs"] / out["revenue"]
+
     return out
 
+
+# ── 텍스트 추출 ───────────────────────────────────────────────────
 
 def extract_revenue_note_candidates(text: str) -> list[str]:
     keywords = ("매출처", "주요 고객", "주요 매출", "매출실적", "영업부문", "제품별", "지역별")
     blocks = re.split(r"\n{2,}|(?=\d+\.\s)", text)
     candidates = []
     for block in blocks:
-        if any(keyword in block for keyword in keywords) and ("매출" in block or "수익" in block):
+        if any(keyword in block for keyword in keywords) and (
+            "매출" in block or "수익" in block
+        ):
             compact = re.sub(r"\s+", " ", block).strip()
             if 60 <= len(compact) <= 3000:
                 candidates.append(compact)
     return candidates[:20]
 
 
+# ── CSV / JSON 헬퍼 ───────────────────────────────────────────────
+
 def write_filings_csv(filings: list[Filing], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([asdict(f) for f in filings]).to_csv(output, index=False, encoding="utf-8-sig")
+    pd.DataFrame([asdict(f) for f in filings]).to_csv(
+        output, index=False, encoding="utf-8-sig"
+    )
 
 
 def write_company_json(company: Company, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(asdict(company), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(asdict(company), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
