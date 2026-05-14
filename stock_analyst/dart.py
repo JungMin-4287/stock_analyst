@@ -360,25 +360,30 @@ def normalize_cumulative_financials(
             if not metric:
                 continue
 
-            # DART 분기보고서 금액 필드 선택 전략
+            # DART 보고서 금액 필드 선택 전략
             # ─────────────────────────────────────────────────────
-            # Q3(11014): thstrm_amount = 3개월 단독 / thstrm_add_amount = 9개월 누적
-            #            → add_amount 가 있고 abs(add_amount) >= abs(thstrm_amount) 이면 누적으로 판단
-            #            → 없거나 작으면 thstrm_amount 사용 (일부 회사는 thstrm_amount 가 이미 누적)
-            # Q1(11013): 둘 다 1분기 값이므로 동일. thstrm_amount 우선
-            # H1(11012) / FY(11011): thstrm_amount 가 이미 누적값
-            if report_period == "Q3":
+            # 반기/분기보고서에 "3개월 | 누적" 두 컬럼이 모두 있는 회사가 있음:
+            #   thstrm_amount     = 해당 기간 3개월 단독값 (Q2 또는 Q3 단독)
+            #   thstrm_add_amount = 당해 사업연도 누적값 (Jan-Jun 또는 Jan-Sep)
+            #
+            # derive_quarterly_metrics 에서 누적값 차감으로 분기 실적을 계산하므로
+            # H1(11012) · Q3(11014) 모두 누적값(thstrm_add_amount)이 필요.
+            # abs() 비교로 둘 중 더 큰 값 = 누적으로 판단.
+            #
+            # Q1(11013): thstrm_amount == thstrm_add_amount (1분기 = 누적 동일)
+            # FY(11011): thstrm_amount 가 연간 전체값
+            if report_period in ("Q3", "H1"):
                 add_amt  = _to_number(row.get("thstrm_add_amount"))
                 term_amt = _to_number(row.get("thstrm_amount"))
                 if add_amt is not None and term_amt is not None:
-                    # 절댓값 기준: add_amount >= thstrm_amount → 누적으로 판단
+                    # 절댓값 기준: 더 큰 값 = 누적으로 판단
                     amount = add_amt if abs(add_amt) >= abs(term_amt) else term_amt
                 elif add_amt is not None:
                     amount = add_amt
                 else:
                     amount = term_amt
             else:
-                # Q1·H1·FY 는 thstrm_amount 사용 (이미 누적 또는 전체)
+                # Q1·FY 는 thstrm_amount 사용
                 amount = _to_number(row.get("thstrm_amount"))
 
             if amount is None:
@@ -606,9 +611,4 @@ def write_filings_csv(filings, output: Path) -> None:
 
 
 def write_company_json(company, output: Path) -> None:
-    from dataclasses import asdict
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps(asdict(company), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    from dataclasses import asdic
