@@ -152,16 +152,18 @@ def _parse_backlog_value(snippet: str, hint_unit: str | None = None) -> tuple[fl
     if not hint_unit:
         return None, None
 
-    # ② "합계" / "계" 행 — 같은 행(개행 전)의 숫자만 추출 → 마지막 = 수주잔고 열
-    #    300자 윈도우는 각주 숫자를 오염시키므로 첫 개행까지만 사용
+    # ② "합계" / "계" 행 이후 숫자들 → 마지막 = 수주잔고 열
+    #    BeautifulSoup 추출 시 셀마다 줄바꿈이 들어오므로 300자 윈도우 사용.
+    #    단, 각주(주1), ※ 등) 시작 지점에서 자르기 → 각주 숫자 오염 방지.
     agg_m = re.search(r"(?:합\s*계|소\s*계)", snippet)
     if agg_m:
-        rest = snippet[agg_m.end():]
-        # 같은 행 끝(개행) 또는 최대 200자 — 각주가 섞이지 않도록
-        nl_pos = rest.find("\n")
-        row_text = rest[:nl_pos] if 0 < nl_pos <= 200 else rest[:200]
-        nums = re.findall(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,}", row_text)
-        # 연도 제외 (4자리 19xx/20xx)
+        window = snippet[agg_m.end(): agg_m.end() + 300]
+        # 각주 마커 위치에서 잘라냄
+        fn_m = re.search(r"(?:주\s*\d+\s*\)|※|참\s*고\s*:)", window)
+        if fn_m:
+            window = window[:fn_m.start()]
+        nums = re.findall(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,}", window)
+        # 연도(19xx/20xx) 및 날짜(월일) 제외
         nums = [n for n in nums if not re.fullmatch(r"(?:19|20)\d{2}", n.replace(",", ""))]
         if nums:
             try:
@@ -496,5 +498,4 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].round(2)
         elif col in {"dio", "dso"} and col in out.columns:
             out[col] = out[col].round(1)
-    rename_map = {c: COLUMN_LABELS.get(c, c) for c in out.columns}
-    return out.rename(columns=rename_map)
+    rename_map 
