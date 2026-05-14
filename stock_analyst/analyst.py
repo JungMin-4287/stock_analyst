@@ -105,6 +105,77 @@ def derive_full_metrics(
 
 # ── 텍스트 기반 지표 추출 ─────────────────────────────────────────
 
+def _parse_backlog_value(snippet: str, hint_unit: str | None = None) -> tuple[float | None, str | None]:
+    """
+    수주잔고 섹션 스니펫에서 잔고 금액을 추출.
+
+    DART 텍스트 추출 시 표 셀이 공백으로 분리되므로,
+    "합계" 또는 "수주잔고" 키워드 이후의 숫자를 우선 탐색.
+    """
+    multiplier_map = {
+        "백만원": 0.01, "억원": 1.0, "천억원": 1000.0,
+        "조원": 10000.0, "원": 1e-8, "천원": 1e-5,
+    }
+
+    # 단위 재확인
+    if hint_unit is None:
+        unit_m = re.search(
+            r"단위\s*[：:\s]\s*(?:천[㎡㎥]?\s*[,，]\s*)?(백만원|억원|천억원|조원|원|천원)",
+            snippet
+        )
+        if unit_m:
+            hint_unit = unit_m.group(1)
+
+    mult = multiplier_map.get(hint_unit or "", 1.0)
+
+    # 명시적 단위 붙은 숫자 우선 (예: "35,000억원")
+    m = re.search(r"([0-9,]{3,})\s*(백만원|억원|천억원|조원|원|천원)", snippet)
+    if m:
+        raw = m.group(1).replace(",", "")
+        unit = m.group(2)
+        try:
+            return float(raw) * multiplier_map.get(unit, 1.0), unit
+        except ValueError:
+            pass
+
+    # "합계" 또는 "계" 행 직후 숫자들에서 마지막 큰 값 (= 수주잔고 열)
+    agg_m = re.search(r"(?:합\s*계|소\s*계)\s+((?:[0-9,]+\s+)+)", snippet)
+    if agg_m and hint_unit:
+        nums = re.findall(r"[0-9,]{3,}", agg_m.group(1))
+        if nums:
+            try:
+                return float(nums[-1].replace(",", "")) * mult, hint_unit
+            except ValueError:
+                pass
+
+    # "수주잔고" 컬럼명 이후 숫자들 중 마지막 값
+    col_m = re.search(r"수주\s*잔고\s+((?:[0-9,]+[\s\-]+)+)", snippet)
+    if col_m and hint_unit:
+        nums = re.findall(r"[0-9,]{3,}", col_m.group(1))
+        if nums:
+            try:
+                return float(nums[-1].replace(",", "")) * mult, hint_unit
+            except ValueError:
+                pass
+
+    # 전체 스니펫에서 큰 숫자 fallback
+    if hint_unit:
+        nums = re.findall(r"\b([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})\b", snippet)
+        if nums:
+            # 연도처럼 생긴 4자리 숫자(1990~2099) 제외
+            candidates = [n.replace(",", "") for n in nums
+                          if not re.fullmatch(r"(?:19|20)\d{2}", n.replace(",", ""))]
+            if candidates:
+                # 가장 큰 숫자를 총 수주잔고로 추정
+                try:
+                    best = max(candidates, key=lambda x: int(x))
+                    return float(best) * mult, hint_unit
+                except ValueError:
+                    pass
+
+    return None, None
+
+
 def _parse_amount_in_snippet(snippet: str, hint_unit: str | None = None) -> tuple[float | None, str | None]:
     """
     스니펫에서 금액 숫자를 찾아 (값_억원, 단위문자열) 반환.
@@ -162,31 +233,41 @@ def extract_order_backlog(text: str) -> list[dict[str, Any]]:
 
     # ── 섹션 헤더 탐지 (넓은 창으로 전체 섹션 캡처) ──
     section_patterns = [
-        # "라. 수주상황", "마. 수주현황" 등 목차 형식
+        # "라. 수주상황", "가. 수주잔고" 등 목차 하위 항목
         r"[가나다라마바사아자차카타파하]\.\s*수주[상황현황잔고]",
-        r"\d+\.\s*수주[상황현황잔고]",
+        # "4. 수주상황", "4. 수주현황"
+        r"\d+\.\s*수주[상황현황잔고실적]",
+        # ★ "4. 매출 및 수주상황" — DART 빈출 헤딩 (대명에너지 등)
+        r"\d+\.\s*매출\s*(?:및\s*)?수주[상황현황]",
+        r"매출\s*및\s*수주[상황현황]",
+        # 단독 키워드
         r"수주\s*상황",
         r"수주\s*현황",
         r"수주잔고\s*현황",
         r"Order\s*Backlog",
         r"수주\s*실적",
+        r"수주\s*잔고",
     ]
     for pat in section_patterns:
         for m in re.finditer(pat, text, re.IGNORECASE):
             start = max(0, m.start() - 50)
-            end = min(len(text), m.end() + 2000)   # 섹션 전체 캡처 (2000자)
+            end = min(len(text), m.end() + 3000)   # 섹션 전체 캡처 (3000자)
             block = text[start:end]
             snippet = re.sub(r"\s+", " ", block).strip()
 
             # 단위 파악 (로컬 우선, 없으면 전역)
-            local_unit_m = re.search(r"단위\s*[：:]\s*(?:천[㎡㎥]?\s*,\s*)?(백만원|억원|천억원|조원|원)", block)
+            local_unit_m = re.search(
+                r"단위\s*[：:\s]\s*(?:천[㎡㎥]?\s*[,，]\s*)?(백만원|억원|천억원|조원|원|천원)",
+                block
+            )
             hint = local_unit_m.group(1) if local_unit_m else global_unit
 
-            parsed, found_unit = _parse_amount_in_snippet(snippet, hint)
-            label = "기납품 수주잔고" if "기납품" in snippet[:300] else "수주잔고"
+            # 합계/잔고 행에서 마지막 큰 수치 우선 파싱
+            parsed, found_unit = _parse_backlog_value(snippet, hint)
+            label = "기납품 수주잔고" if "기납품" in snippet[:400] else "수주잔고"
             results.append({
                 "label": label,
-                "snippet": snippet[:1000],
+                "snippet": snippet[:1200],
                 "parsed_value": parsed,
                 "unit": found_unit or hint or "억원",
             })
@@ -331,7 +412,7 @@ def extract_product_revenue(text: str) -> list[dict]:
             end = min(len(text), m.end() + 2500)
             block = text[start:end]
             snippet = re.sub(r"\s+", " ", block).strip()
-            unit_m = re.search(r"단위\s*[:\uff1a]\s*(백만원|억원|천억원|조원|원|천원)", block)
+            unit_m = re.search(r"단위\s*[:：]\s*(백만원|억원|천억원|조원|원|천원)", block)
             unit = unit_m.group(1) if unit_m else None
             numbers = re.findall(r"\b([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})\b", snippet)
             label_text = re.sub(r"\s+", " ", text[m.start():m.end()]).strip()
