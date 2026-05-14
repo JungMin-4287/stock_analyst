@@ -429,7 +429,7 @@ def load_text_data(
         )
         try:
             text = client.document_text(filing.rcept_no)
-            # 보고서 기간 레이블 (예: "2025-Q3") — 패턴 학습에 사용
+            # 보고서 기간 레이블 (패턴 학습용)
             period_label = filing.rcept_dt[:4] + "-" + filing.report_nm[:4]
             bl = extract_order_backlog(
                 text,
@@ -1070,4 +1070,11 @@ with tab_data:
             "차입금(십억원)": "단기+장기차입금+사채 합계",
             "재고자산회전율(회/년)": "연환산 재고자산회전율",
             "매출채권회전율(회/년)": "연환산 매출채권회전율",
-            "재고일수(
+            "재고일수(DIO, 일)": "365 / 재고자산회전율",
+            "매출채권회수일(DSO, 일)": "365 / 매출채권회전율",
+        }
+        desc_df = pd.DataFrame(
+            [{"컬럼명": k, "설명": v} for k, v in col_desc.items()
+             if k in display_full.columns]
+        )
+        st.dataframe(desc_df, use_container_width=True, height=300, hide_index=True)
