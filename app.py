@@ -914,4 +914,64 @@ with tab_prod:
                     key = f"{item.get('rcept_dt', '')}_{item.get('report_nm', '')}"
                     seen_reports.setdefault(key, []).append(item)
 
-                for report_key, items in list(se
+                for report_key, items in list(seen_reports.items())[:8]:
+                    first = items[0]
+                    with st.expander(
+                        f"[{first.get('rcept_dt', '')}] {first.get('report_nm', '')}",
+                        expanded=(list(seen_reports.keys()).index(report_key) == 0),
+                    ):
+                        for item in items[:4]:
+                            unit_str = f"  *(unit: {item['unit']})*" if item.get("unit") else ""
+                            st.markdown(f"**{item['label']}**{unit_str}")
+                            st.text(item["snippet"])
+                            st.markdown("---")
+
+            st.caption(
+                "DART 보고서 원문 텍스트 추출 결과입니다. "
+                "표 구조가 무너진 경우 원본 공시를 함께 확인하세요."
+            )
+
+
+# TAB 7: 전체 데이터 다운로드
+with tab_data:
+    st.subheader("전체 데이터 테이블 및 다운로드")
+
+    if df.empty:
+        st.warning("데이터가 없습니다.")
+    else:
+        display_full = format_display_df(df)
+        st.dataframe(display_full, use_container_width=True, height=500)
+
+        csv_bytes = display_full.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            label="CSV 다운로드",
+            data=csv_bytes,
+            file_name=f"{company.stock_code}_{company.corp_name}_financial.csv",
+            mime="text/csv",
+        )
+
+        col_desc = {
+            "분기": "YYYYQN (예: 2024Q1)",
+            "data_source": "Q4 등 파생 분기의 차감 출처 (예: FY - Q3)",
+            "매출액(십억원)": "분기 매출액",
+            "매출원가(십억원)": "분기 매출원가",
+            "매출총이익(십억원)": "매출액 - 매출원가",
+            "영업이익(십억원)": "분기 영업이익",
+            "순이익(십억원)": "분기 당기순이익",
+            "GPM(%)": "매출총이익률",
+            "OPM(%)": "영업이익률",
+            "NPM(%)": "순이익률",
+            "원가비중(%)": "매출원가 / 매출액",
+            "재고자산(십억원)": "분기말 재고자산",
+            "매출채권(십억원)": "분기말 매출채권",
+            "차입금(십억원)": "단기+장기차입금+사채 합계",
+            "재고자산회전율(회/년)": "연환산 재고자산회전율",
+            "매출채권회전율(회/년)": "연환산 매출채권회전율",
+            "재고일수(DIO, 일)": "365 / 재고자산회전율",
+            "매출채권회수일(DSO, 일)": "365 / 매출채권회전율",
+        }
+        desc_df = pd.DataFrame(
+            [{"컬럼명": k, "설명": v} for k, v in col_desc.items()
+             if k in display_full.columns]
+        )
+        st.dataframe(desc_df, use_container_width=True, height=300, hide_index=True)
