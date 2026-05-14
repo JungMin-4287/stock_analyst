@@ -187,6 +187,60 @@ def make_line_chart(
     return fig
 
 
+def make_backlog_chart(order_backlogs: list) -> go.Figure | None:
+    """수주잔고 시계열 막대 차트."""
+    parsed = [i for i in order_backlogs if i.get("parsed_value") is not None]
+    if not parsed:
+        return None
+
+    # 보고서당 첫 번째 값만 사용 (중복 제거)
+    seen: dict[tuple, dict] = {}
+    for item in parsed:
+        key = (item.get("rcept_dt", ""), item.get("label", ""))
+        if key not in seen:
+            seen[key] = item
+
+    items = sorted(seen.values(), key=lambda x: x.get("rcept_dt", ""))
+    backlog_items = [i for i in items if "기납품" not in i.get("label", "")]
+    delivered_items = [i for i in items if "기납품" in i.get("label", "")]
+
+    def fmt_dt(d: str) -> str:
+        return f"{d[:4]}.{d[4:6]}" if len(d) == 8 else d
+
+    fig = go.Figure()
+    if backlog_items:
+        vals = [i["parsed_value"] for i in backlog_items]
+        fig.add_trace(go.Bar(
+            x=[fmt_dt(i.get("rcept_dt", "")) for i in backlog_items],
+            y=vals,
+            name="수주잔고",
+            marker_color="#4C9BE8",
+            text=[f"{v:,.0f}" for v in vals],
+            textposition="outside",
+        ))
+    if delivered_items:
+        vals = [i["parsed_value"] for i in delivered_items]
+        fig.add_trace(go.Bar(
+            x=[fmt_dt(i.get("rcept_dt", "")) for i in delivered_items],
+            y=vals,
+            name="기납품 수주잔고",
+            marker_color="#F5A623",
+            text=[f"{v:,.0f}" for v in vals],
+            textposition="outside",
+        ))
+
+    fig.update_layout(
+        title="수주잔고 추이 (단위: 억원)",
+        barmode="group",
+        template="plotly_white",
+        height=380,
+        margin=dict(l=40, r=40, t=60, b=40),
+        yaxis_title="금액(억원)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
 def make_stacked_area_chart(
     df: pd.DataFrame,
     title: str,
@@ -279,7 +333,12 @@ def load_data(
     fs_div: str,
     include_all_quarters: bool,
 ) -> dict:
-    """DART 에서 IS + BS 데이터를 수집해 dict 로 반환."""
+    """DART 에서 IS + BS 데이터를 수집해 dict 로 반환.
+
+    일부 기업(중소형 코스닥 등)은 연결(CFS) 분기/반기보고서를 제출하지 않고
+    사업보고서(FY)만 CFS로 제출합니다. 이 경우 Q4 = FY 전체가 되는 오류를 방지하기 위해
+    CFS 분기 데이터가 없으면 별도(OFS)로 자동 전환합니다.
+    """
     client = DartClient(api_key, cache_dir=".cache/dart")
     company = client.find_company(corp_name or None, stock_code or None)
 
@@ -290,27 +349,44 @@ def load_data(
     else:
         end_year_codes = ["11013"]  # Q1만
 
-    frames: list[tuple[int, str, pd.DataFrame]] = []
-    total_calls = sum(
-        len(all_report_codes if y < end_year else end_year_codes)
-        for y in range(start_year, end_year + 1)
-    )
-    progress = st.progress(0, text="DART 데이터 수집 중...")
-    done = 0
-
+    year_code_pairs: list[tuple[int, str]] = []
     for year in range(start_year, end_year + 1):
         codes = all_report_codes if year < end_year else end_year_codes
         for code in codes:
-            label = f"{year}년 {REPORT_CODES[code]} 보고서 수집 중..."
-            progress.progress(done / max(total_calls, 1), text=label)
+            year_code_pairs.append((year, code))
+
+    total_calls = len(year_code_pairs)
+    progress = st.progress(0, text="DART 데이터 수집 중...")
+
+    def _fetch_all(target_fs_div: str, progress_offset: int = 0) -> list:
+        frames_out: list[tuple[int, str, pd.DataFrame]] = []
+        for i, (year, code) in enumerate(year_code_pairs):
+            frac = (progress_offset + i) / max(total_calls * 2, 1)
+            progress.progress(min(frac, 0.99),
+                              text=f"{year}년 {REPORT_CODES[code]} ({target_fs_div}) 수집 중...")
             try:
                 df = client.financial_statement_all(
-                    company.corp_code, year, code, fs_div
+                    company.corp_code, year, code, target_fs_div
                 )
-                frames.append((year, code, df))
+                frames_out.append((year, code, df))
             except RuntimeError:
                 pass
-            done += 1
+        return frames_out
+
+    # 1차: 선택 fs_div 로 수집
+    frames = _fetch_all(fs_div, 0)
+
+    # CFS 분기/반기 데이터 없으면 OFS 자동 전환
+    # (일부 기업은 CFS 사업보고서만 제출하고 분기는 OFS만 존재)
+    quarterly_codes = {"11013", "11012", "11014"}
+    has_quarterly = any(
+        code in quarterly_codes and not df.empty
+        for _, code, df in frames
+    )
+    fs_div_actual = fs_div
+    if not has_quarterly and fs_div == "CFS":
+        fs_div_actual = "OFS"
+        frames = _fetch_all("OFS", total_calls)
 
     progress.progress(1.0, text="데이터 처리 중...")
 
@@ -325,6 +401,7 @@ def load_data(
         "company": company,
         "full_df": full_df,
         "bs_data": bs_data,
+        "fs_div_actual": fs_div_actual,
     }
 
 
@@ -511,15 +588,22 @@ if "result" not in st.session_state:
 result = st.session_state["result"]
 company = result["company"]
 df: pd.DataFrame = result["full_df"]
+fs_div_actual = result.get("fs_div_actual", fs_div)
 
 # ── 헤더 ──
 st.markdown(f"## {company.corp_name}  `{company.stock_code}`")
 latest_period = df["period"].iloc[-1] if not df.empty else "N/A"
+fs_label = "연결" if fs_div_actual == "CFS" else "별도"
 st.caption(
-    f"{'연결' if fs_div == 'CFS' else '별도'} 재무제표 기준  ·  "
+    f"{fs_label} 재무제표 기준  ·  "
     f"최근 분기: **{latest_period}**  ·  "
     f"조회기간: {start_year}~{end_year}"
 )
+if fs_div_actual != fs_div:
+    st.warning(
+        f"⚠️ 연결(CFS) 분기/반기보고서 데이터가 없어 **별도(OFS) 기준**으로 자동 전환했습니다. "
+        f"사업보고서는 연결 기준이지만 분기 실적은 별도 기준입니다."
+    )
 
 # ── 최신 분기 요약 지표 (상단 카드) ──
 if not df.empty:
@@ -578,16 +662,19 @@ with tab_pl:
         )
         st.plotly_chart(fig2, use_container_width=True)
 
-        # 테이블
+        # 테이블 (data_source 컬럼으로 Q4 파생 방식 확인 가능)
         st.subheader("데이터 테이블")
-        is_cols = ["period", "revenue", "gross_profit", "operating_profit",
-                   "net_income", "gpm", "opm", "npm"]
+        is_cols = ["period", "data_source", "revenue", "gross_profit",
+                   "operating_profit", "net_income", "gpm", "opm", "npm"]
         display_cols = [c for c in is_cols if c in df.columns]
         st.dataframe(
             format_display_df(df[display_cols]),
             use_container_width=True,
             height=320,
         )
+        if "data_source" in df.columns:
+            st.caption("※ 데이터출처: Q4는 사업보고서(FY) 누적값에서 직전 분기 누적을 차감해 산출합니다."
+                       " FY−Q3 = Q4, FY−H1 = H2 (Q3 보고서 없는 경우) 등으로 표시됩니다.")
 
 
 # ═════════════════════════════════════════════════
@@ -823,6 +910,11 @@ with tab_order:
             # 파싱된 수치가 있는 항목 우선
             parsed_items = [i for i in order_backlogs if i.get("parsed_value") is not None]
             if parsed_items:
+                # 수주잔고 추이 차트
+                fig_bl = make_backlog_chart(order_backlogs)
+                if fig_bl is not None:
+                    st.plotly_chart(fig_bl, use_container_width=True)
+
                 parsed_df = pd.DataFrame([
                     {
                         "보고서": i["report_nm"],
@@ -833,6 +925,8 @@ with tab_order:
                     for i in parsed_items
                 ])
                 st.dataframe(parsed_df, use_container_width=True)
+            else:
+                st.info("수주잔고 섹션은 찾았으나 수치 파싱에 실패했습니다. 아래 원문을 직접 확인하세요.")
 
             st.markdown("**추출된 원문 스니펫**")
             for item in order_backlogs[:6]:
@@ -952,7 +1046,7 @@ with tab_data:
 
         col_desc = {
             "분기": "YYYYQN (예: 2024Q1)",
-            "data_source": "Q4 등 파생 분기의 차감 출처 (예: FY - Q3)",
+            "데이터출처": "Q4 등 파생 분기의 차감 출처 (예: FY - Q3)",
             "매출액(십억원)": "분기 매출액",
             "매출원가(십억원)": "분기 매출원가",
             "매출총이익(십억원)": "매출액 - 매출원가",
