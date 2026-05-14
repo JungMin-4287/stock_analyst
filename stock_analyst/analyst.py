@@ -133,11 +133,17 @@ def _parse_backlog_value(snippet: str, hint_unit: str | None = None) -> tuple[fl
 
     mult = multiplier_map.get(hint_unit or "", 1.0)
 
-    # ① 명시적 단위 붙은 숫자 (예: "35,000억원")
-    m = re.search(r"([0-9,]{3,})\s*(백만원|억원|천억원|조원|원|천원)", snippet)
-    if m:
-        raw = m.group(1).replace(",", "")
-        unit = m.group(2)
+    # ① "수주잔고" 컨텍스트에서 명시적 단위 붙은 숫자만 (수주총액 오인 방지)
+    #    수주잔고 키워드 뒤 50자 이내에 number+unit 패턴이 있을 때만 사용
+    #    (H1/Q3 보고서에서 "수주총액은 13,162억원" 같은 문장이 앞에 나와
+    #     수주총액을 잘못 반환하는 버그 방지)
+    backlog_ctx = re.search(
+        r"수주\s*잔고.{0,50}?([0-9,]{3,})\s*(백만원|억원|천억원|조원|원|천원)",
+        snippet, re.DOTALL
+    )
+    if backlog_ctx:
+        raw = backlog_ctx.group(1).replace(",", "")
+        unit = backlog_ctx.group(2)
         try:
             return float(raw) * multiplier_map.get(unit, 1.0), unit
         except ValueError:
@@ -146,12 +152,15 @@ def _parse_backlog_value(snippet: str, hint_unit: str | None = None) -> tuple[fl
     if not hint_unit:
         return None, None
 
-    # ② "합계" / "계" 행 이후 숫자들 → 마지막 숫자 = 수주잔고 열
-    #    (텍스트 추출 시 "-" 나 날짜 등 비숫자 토큰이 섞여 있어 직접 숫자만 추출)
+    # ② "합계" / "계" 행 — 같은 행(개행 전)의 숫자만 추출 → 마지막 = 수주잔고 열
+    #    300자 윈도우는 각주 숫자를 오염시키므로 첫 개행까지만 사용
     agg_m = re.search(r"(?:합\s*계|소\s*계)", snippet)
     if agg_m:
-        after = snippet[agg_m.end(): agg_m.end() + 300]
-        nums = re.findall(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,}", after)
+        rest = snippet[agg_m.end():]
+        # 같은 행 끝(개행) 또는 최대 200자 — 각주가 섞이지 않도록
+        nl_pos = rest.find("\n")
+        row_text = rest[:nl_pos] if 0 < nl_pos <= 200 else rest[:200]
+        nums = re.findall(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,}", row_text)
         # 연도 제외 (4자리 19xx/20xx)
         nums = [n for n in nums if not re.fullmatch(r"(?:19|20)\d{2}", n.replace(",", ""))]
         if nums:
@@ -477,6 +486,7 @@ PERCENT_COLS = {"opm", "gpm", "npm", "cogs_ratio"}
 
 def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
     for col in df.columns:
         if col in BILLION_WON_COLS and col in out.columns:
             out[col] = (out[col] / 1_000_000_000).round(1)
