@@ -415,15 +415,49 @@ def normalize_bs_financials(
 
 # ── IS 분기 파생 ──────────────────────────────────────────────────
 
+# DART 보고서 코드별 처리 순서 (연도 내 시간 순)
+_REPORT_PROCESS_ORDER = {"Q1": 1, "H1": 2, "Q3": 3, "FY": 4}
+# 보고서 코드 → 분기 번호 매핑 (H1=반기 → Q2, FY=사업보고서 → Q4)
+_REPORT_TO_QUARTER = {"Q1": 1, "H1": 2, "Q3": 3, "FY": 4}
+
+
 def derive_quarterly_metrics(cumulative: pd.DataFrame) -> pd.DataFrame:
     """
-    누적 IS 데이터에서 분기값을 차감해 실제 분기 실적 DataFrame을 반환.
-    FY 값 = Q4 분기값으로 환산 (FY - Q3 누적).
+    누적 IS 데이터 → 실제 분기 실적 DataFrame
+
+    DART 보고서별 누적 구조
+    ───────────────────────────────────────────────────────────
+    11013 (분기보고서 Q1) : 1~3월 누적
+    11012 (반기보고서 H1) : 1~6월 누적
+    11014 (분기보고서 Q3) : 1~9월 누적
+    11011 (사업보고서  FY) : 1~12월 누적  ← Q4 별도 보고서 없음
+
+    차감 규칙 (연도 내 순서대로 누적 추적)
+    ───────────────────────────────────────────────────────────
+    Q1 실적 = Q1 누적                     (기준값, 차감 없음)
+    Q2 실적 = H1 누적  − Q1 누적
+    Q3 실적 = Q3 누적  − H1 누적
+    Q4 실적 = FY 누적  − Q3 누적          ← 사업보고서에서 직전 9개월 차감
+
+    중간 보고서 누락 시 처리
+    ───────────────────────────────────────────────────────────
+    예) Q3 보고서 없이 FY만 있으면:
+        Q4로 표기하되 data_note = "FY−H1 (Q3 보고서 없음)"
+    예) Q1·H1 없이 FY만 있으면:
+        Q4로 표기하되 data_note = "FY only (중간 보고서 없음)"
+    이 경우 해당 분기 수치는 복수 분기 합산임을 data_note 로 표시.
     """
     if cumulative.empty:
-        return cumulative
+        return pd.DataFrame()
 
-    report_to_quarter = {"Q1": 1, "H1": 2, "Q3": 3, "FY": 4}
+    # ── 피벗: (year, report_period) × metric ──
+    metric_cols = [
+        c for c in ["revenue", "cogs", "gross_profit", "operating_profit", "net_income"]
+        if c in cumulative["metric"].values
+    ]
+    if not metric_cols:
+        return pd.DataFrame()
+
     pivot = (
         cumulative.pivot_table(
             index=["year", "report_period"],
@@ -433,67 +467,22 @@ def derive_quarterly_metrics(cumulative: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-    pivot["quarter"] = pivot["report_period"].map(report_to_quarter)
-    pivot = pivot.sort_values(["year", "quarter"])
+    pivot["_order"] = pivot["report_period"].map(_REPORT_PROCESS_ORDER)
+    pivot = pivot.sort_values(["year", "_order"]).reset_index(drop=True)
 
-    metric_cols = [
-        c for c in ["revenue", "cogs", "gross_profit", "operating_profit", "net_income"]
-        if c in pivot.columns
-    ]
-    out = pivot[["year", "quarter"]].copy()
-    out["period"] = out["year"].astype(str) + "Q" + out["quarter"].astype(str)
+    # ── 연도별 명시적 누적 차감 루프 ──
+    records: list[dict] = []
 
-    for metric in metric_cols:
-        out[metric] = pivot.groupby("year")[metric].diff().fillna(pivot[metric])
+    for year, year_df in pivot.groupby("year", sort=True):
+        year_df = year_df.sort_values("_order").reset_index(drop=True)
 
-    # 마진율 계산
-    revenue = out.get("revenue")
-    if revenue is not None:
-        if "operating_profit" in out.columns:
-            out["opm"] = out["operating_profit"] / revenue
-        if "gross_profit" in out.columns:
-            out["gpm"] = out["gross_profit"] / revenue
-        if "net_income" in out.columns:
-            out["npm"] = out["net_income"] / revenue
-        if "cogs" in out.columns:
-            out["cogs_ratio"] = out["cogs"] / revenue
+        # 직전 누적값 (연초 = 0으로 초기화)
+        prev_cum: dict[str, float] = {m: 0.0 for m in metric_cols}
+        prev_label: str = "연초"   # 어떤 보고서를 baseline으로 쓰는지 추적
 
-    # cogs 없을 경우 gross_profit으로 역산
-    if "cogs" not in out.columns and "gross_profit" in out.columns and "revenue" in out.columns:
-        out["cogs"] = out["revenue"] - out["gross_profit"]
-        out["cogs_ratio"] = out["cogs"] / out["revenue"]
+        for _, row in year_df.iterrows():
+            rp: str = row["report_period"]   # "Q1" | "H1" | "Q3" | "FY"
+            quarter: int = _REPORT_TO_QUARTER[rp]
 
-    return out
-
-
-# ── 텍스트 추출 ───────────────────────────────────────────────────
-
-def extract_revenue_note_candidates(text: str) -> list[str]:
-    keywords = ("매출처", "주요 고객", "주요 매출", "매출실적", "영업부문", "제품별", "지역별")
-    blocks = re.split(r"\n{2,}|(?=\d+\.\s)", text)
-    candidates = []
-    for block in blocks:
-        if any(keyword in block for keyword in keywords) and (
-            "매출" in block or "수익" in block
-        ):
-            compact = re.sub(r"\s+", " ", block).strip()
-            if 60 <= len(compact) <= 3000:
-                candidates.append(compact)
-    return candidates[:20]
-
-
-# ── CSV / JSON 헬퍼 ───────────────────────────────────────────────
-
-def write_filings_csv(filings: list[Filing], output: Path) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([asdict(f) for f in filings]).to_csv(
-        output, index=False, encoding="utf-8-sig"
-    )
-
-
-def write_company_json(company: Company, output: Path) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps(asdict(company), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+            rec: dict = {
+       
