@@ -46,6 +46,7 @@ try:
         derive_full_metrics,
         extract_order_backlog,
         extract_utilization,
+        extract_product_revenue,
         format_display_df,
         BILLION_WON_COLS,
         PERCENT_COLS,
@@ -334,12 +335,13 @@ def load_text_data(
     start_date: str,
     end_date: str,
 ) -> dict:
-    """DART 보고서 원문을 수집해 수주잔고/가동율을 추출."""
+    """DART 보고서 원문을 수집해 수주잔고/가동율/제품별매출을 추출."""
     client = DartClient(api_key, cache_dir=".cache/dart")
     filings = client.filings(corp_code, start_date, end_date)
 
     order_backlogs: list[dict] = []
     utilizations: list[dict] = []
+    product_revenues: list[dict] = []
 
     text_progress = st.progress(0, text="보고서 원문 수집 중 (시간이 걸릴 수 있습니다)...")
     for i, filing in enumerate(filings):
@@ -351,6 +353,7 @@ def load_text_data(
             text = client.document_text(filing.rcept_no)
             bl = extract_order_backlog(text)
             ut = extract_utilization(text)
+            pr = extract_product_revenue(text)
             for item in bl:
                 item["report_nm"] = filing.report_nm
                 item["rcept_dt"] = filing.rcept_dt
@@ -359,11 +362,19 @@ def load_text_data(
                 item["report_nm"] = filing.report_nm
                 item["rcept_dt"] = filing.rcept_dt
                 utilizations.append(item)
+            for item in pr:
+                item["report_nm"] = filing.report_nm
+                item["rcept_dt"] = filing.rcept_dt
+                product_revenues.append(item)
         except Exception:
             pass
 
     text_progress.empty()
-    return {"order_backlogs": order_backlogs, "utilizations": utilizations}
+    return {
+        "order_backlogs": order_backlogs,
+        "utilizations": utilizations,
+        "product_revenues": product_revenues,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -533,15 +544,17 @@ tab_labels = [
     "🏦 재무상태표",
     "🔄 효율성 지표",
     "📋 수주잔고 / 가동율",
+    "📦 제품별 매출",
     "📥 전체 데이터",
 ]
 tabs = st.tabs(tab_labels)
+tab_pl, tab_cost, tab_bs, tab_eff, tab_order, tab_prod, tab_data = tabs
 
 
 # ═════════════════════════════════════════════════
 # TAB 1: 손익계산서
 # ═════════════════════════════════════════════════
-with tabs[0]:
+with tab_pl:
     st.subheader("매출액 / 영업이익 / 순이익 추이")
 
     if df.empty:
@@ -580,7 +593,7 @@ with tabs[0]:
 # ═════════════════════════════════════════════════
 # TAB 2: 원가 구조
 # ═════════════════════════════════════════════════
-with tabs[1]:
+with tab_cost:
     st.subheader("원가 구조 분석")
 
     cogs_available = "cogs" in df.columns or "gross_profit" in df.columns
@@ -631,7 +644,7 @@ with tabs[1]:
 # ═════════════════════════════════════════════════
 # TAB 3: 재무상태표
 # ═════════════════════════════════════════════════
-with tabs[2]:
+with tab_bs:
     st.subheader("주요 재무상태표 항목 추이")
 
     bs_cols_present = [
@@ -689,7 +702,7 @@ with tabs[2]:
 # ═════════════════════════════════════════════════
 # TAB 4: 효율성 지표
 # ═════════════════════════════════════════════════
-with tabs[3]:
+with tab_eff:
     st.subheader("운전자본 효율성 지표")
 
     turnover_present = any(
@@ -770,7 +783,7 @@ with tabs[3]:
 # ═════════════════════════════════════════════════
 # TAB 5: 수주잔고 / 가동율
 # ═════════════════════════════════════════════════
-with tabs[4]:
+with tab_order:
     st.subheader("수주잔고 / 공장 가동율")
 
     if not st.session_state.get("fetch_text"):
@@ -864,49 +877,41 @@ with tabs[4]:
 
 
 # ═════════════════════════════════════════════════
-# TAB 6: 전체 데이터 다운로드
+# TAB 6: 제품별 / 부문별 매출
 # ═════════════════════════════════════════════════
-with tabs[5]:
-    st.subheader("전체 데이터 테이블 및 다운로드")
+with tab_prod:
+    st.subheader("제품별 / 부문별 / 지역별 매출 현황")
 
-    if df.empty:
-        st.warning("데이터가 없습니다.")
+    if not st.session_state.get("fetch_text"):
+        st.info(
+            "이 분석은 DART 보고서 원문을 추가로 다운로드해야 합니다.\n\n"
+            "사이드바에서 **'수주잔고 / 가동율 분석'** 체크박스를 켜고 **분석 시작**을 다시 클릭하세요."
+        )
     else:
-        display_full = format_display_df(df)
-        st.dataframe(display_full, use_container_width=True, height=500)
+        if "text_result" not in st.session_state:
+            st.warning("먼저 수주잔고/가동율 탭을 열어 데이터를 로딩해주세요.")
+        else:
+            text_result = st.session_state["text_result"]
+            product_revenues = text_result.get("product_revenues", [])
 
-        # CSV 다운로드
-        csv_bytes = display_full.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button(
-            label="📥 CSV 다운로드",
-            data=csv_bytes,
-            file_name=f"{company.stock_code}_{company.corp_name}_재무분석.csv",
-            mime="text/csv",
-        )
+            if not product_revenues:
+                st.warning(
+                    "제품별/부문별 매출 현황 섹션을 찾지 못했습니다.\n\n"
+                    "가능한 원인:\n"
+                    "- DART 보고서에 별도 표기 없음\n"
+                    "- 섹션 명칭이 표준과 다름 (원문 스니펫을 직접 확인하세요)"
+                )
+            else:
+                # 최신 보고서 우선 표시 (rcept_dt 내림차순)
+                product_revenues_sorted = sorted(
+                    product_revenues,
+                    key=lambda x: (x.get("rcept_dt", ""), -x.get("numbers_found", 0)),
+                    reverse=True,
+                )
+                # 보고서별로 그룹핑해서 표시
+                seen_reports: dict[str, list] = {}
+                for item in product_revenues_sorted:
+                    key = f"{item.get('rcept_dt', '')}_{item.get('report_nm', '')}"
+                    seen_reports.setdefault(key, []).append(item)
 
-        # 컬럼 설명
-        st.markdown("**컬럼 설명**")
-        col_desc = {
-            "분기": "YYYYQN 형식 (예: 2024Q1)",
-            "매출액(십억원)": "분기 매출액",
-            "매출원가(십억원)": "분기 매출원가 (없으면 매출총이익에서 역산)",
-            "매출총이익(십억원)": "매출액 - 매출원가",
-            "영업이익(십억원)": "분기 영업이익",
-            "순이익(십억원)": "분기 당기순이익",
-            "GPM(%)": "매출총이익률 = 매출총이익 / 매출액",
-            "OPM(%)": "영업이익률 = 영업이익 / 매출액",
-            "NPM(%)": "순이익률 = 순이익 / 매출액",
-            "원가비중(%)": "매출원가 / 매출액",
-            "재고자산(십억원)": "분기말 재고자산 잔액",
-            "매출채권(십억원)": "분기말 매출채권 잔액",
-            "차입금(십억원)": "단기차입금 + 장기차입금 + 사채 합계",
-            "재고자산회전율(회/년)": "연환산 재고자산회전율 (분기 매출원가×4 / 평균재고)",
-            "매출채권회전율(회/년)": "연환산 매출채권회전율 (분기 매출×4 / 평균매출채권)",
-            "재고일수(DIO, 일)": "365 / 재고자산회전율",
-            "매출채권회수일(DSO, 일)": "365 / 매출채권회전율",
-        }
-        desc_df = pd.DataFrame(
-            [{"컬럼명": k, "설명": v} for k, v in col_desc.items()
-             if k in display_full.columns]
-        )
-        st.dataframe(desc_df, use_container_width=True, height=300, hide_index=True)
+                for report_key, items in list(se
