@@ -285,4 +285,113 @@ def extract_utilization(text: str) -> list[dict[str, Any]]:
             start = max(0, m.start() - 50)
             end = min(len(text), m.end() + 600)
             snippet = re.sub(r"\s+", " ", text[start:end]).strip()
-            pct_match = re.search(r"([0-9]+\.?[0-9]*)\s*%", snippe
+            pct_match = re.search(r"([0-9]+\.?[0-9]*)\s*%", snippet)
+            pct = None
+            if pct_match:
+                try:
+                    pct = float(pct_match.group(1))
+                except ValueError:
+                    pass
+            results.append({
+                "label": "공장 가동율",
+                "snippet": snippet[:600],
+                "parsed_pct": pct,
+            })
+
+    seen: set[str] = set()
+    deduped = []
+    for item in results:
+        key = item["snippet"][:100]
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+
+    return deduped[:10]
+
+
+def extract_product_revenue(text: str) -> list[dict]:
+    results: list[dict] = []
+    section_patterns = [
+        r"[가나다라마바사아자차카타파하]\.\s*(?:주요\s*)?제품[별]?\s*(?:및\s*서비스)?\s*(?:매출|현황|실적)",
+        r"\d+\.\s*(?:주요\s*)?제품[별]?\s*(?:매출|현황|실적)",
+        r"제품별\s*매출\s*현황",
+        r"품목별\s*매출",
+        r"매출\s*현황",
+        r"사업부문별\s*(?:매출|실적|현황)",
+        r"부문별\s*(?:매출|실적|현황)",
+        r"제품\s*및\s*서비스\s*현황",
+        r"주요\s*제품\s*및\s*서비스",
+        r"매출에\s*관한\s*사항",
+        r"영업부문\s*(?:매출|현황)",
+        r"지역별\s*(?:매출|현황)",
+    ]
+    for pat in section_patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            start = max(0, m.start() - 30)
+            end = min(len(text), m.end() + 2500)
+            block = text[start:end]
+            snippet = re.sub(r"\s+", " ", block).strip()
+            unit_m = re.search(r"단위\s*[:\uff1a]\s*(백만원|억원|천억원|조원|원|천원)", block)
+            unit = unit_m.group(1) if unit_m else None
+            numbers = re.findall(r"\b([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})\b", snippet)
+            label_text = re.sub(r"\s+", " ", text[m.start():m.end()]).strip()
+            results.append({
+                "label": label_text[:40],
+                "snippet": snippet[:1200],
+                "unit": unit,
+                "numbers_found": len(numbers),
+            })
+
+    seen: set[str] = set()
+    deduped = []
+    for item in sorted(results, key=lambda x: -x["numbers_found"]):
+        key = item["snippet"][:150]
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+
+    return deduped[:12]
+
+
+COLUMN_LABELS: dict[str, str] = {
+    "period":              "분기",
+    "revenue":             "매출액(십억원)",
+    "cogs":                "매출원가(십억원)",
+    "gross_profit":        "매출총이익(십억원)",
+    "operating_profit":    "영업이익(십억원)",
+    "net_income":          "순이익(십억원)",
+    "opm":                 "OPM(%)",
+    "gpm":                 "GPM(%)",
+    "npm":                 "NPM(%)",
+    "cogs_ratio":          "원가비중(%)",
+    "inventory":           "재고자산(십억원)",
+    "accounts_receivable": "매출채권(십억원)",
+    "total_borrowings":    "차입금(십억원)",
+    "inventory_turnover":  "재고자산회전율(회/년)",
+    "ar_turnover":         "매출채권회전율(회/년)",
+    "dio":                 "재고일수(DIO, 일)",
+    "dso":                 "매출채권회수일(DSO, 일)",
+    "data_source":         "데이터출처",
+}
+
+BILLION_WON_COLS = {
+    "revenue", "cogs", "gross_profit", "operating_profit",
+    "net_income", "inventory", "accounts_receivable", "total_borrowings",
+}
+
+PERCENT_COLS = {"opm", "gpm", "npm", "cogs_ratio"}
+
+
+def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in df.columns:
+        if col in BILLION_WON_COLS and col in out.columns:
+            out[col] = (out[col] / 1_000_000_000).round(1)
+        elif col in PERCENT_COLS and col in out.columns:
+            out[col] = (out[col] * 100).round(1)
+        elif col in {"inventory_turnover", "ar_turnover"} and col in out.columns:
+            out[col] = out[col].round(2)
+        elif col in {"dio", "dso"} and col in out.columns:
+            out[col] = out[col].round(1)
+    rename_map = {c: COLUMN_LABELS.get(c, c) for c in out.columns}
+    return out.rename(columns=rename_map)
