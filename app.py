@@ -412,6 +412,7 @@ def load_text_data(
     corp_name: str,
     start_date: str,
     end_date: str,
+    llm_api_key: str = "",
 ) -> dict:
     """DART 보고서 원문을 수집해 수주잔고/가동율/제품별매출을 추출."""
     client = DartClient(api_key, cache_dir=".cache/dart")
@@ -436,6 +437,7 @@ def load_text_data(
                 corp_code=corp_code,
                 corp_name=corp_name,
                 period=period_label,
+                llm_api_key=llm_api_key or None,
             )
             ut = extract_utilization(text)
             pr = extract_product_revenue(text)
@@ -477,6 +479,15 @@ with st.sidebar:
         value=os.getenv("DART_API_KEY", ""),
         help="https://opendart.fss.or.kr 에서 무료 발급 가능합니다.",
         placeholder="발급받은 API 키를 입력하세요",
+    )
+
+    anthropic_key_input = st.text_input(
+        "🤖 Anthropic API 키 (선택)",
+        type="password",
+        value=os.getenv("ANTHROPIC_API_KEY", ""),
+        help="입력 시 수주잔고 파싱에 Claude AI 를 보조로 사용합니다. "
+             "https://console.anthropic.com 에서 발급.",
+        placeholder="sk-ant-... (없으면 regex만 사용)",
     )
 
     st.markdown("**🔍 종목 검색**")
@@ -561,6 +572,7 @@ if fetch_btn:
         st.session_state["result"] = result
         st.session_state["fetch_text"] = fetch_text
         st.session_state["api_key"] = api_key_input
+        st.session_state["anthropic_key"] = anthropic_key_input
         st.session_state["start_year"] = start_year
         st.session_state["end_year"] = end_year
     except ValueError as e:
@@ -897,6 +909,7 @@ with tab_order:
                     corp_name=company.corp_name,
                     start_date=f"{st.session_state['start_year']}0101",
                     end_date=f"{st.session_state['end_year']}1231",
+                    llm_api_key=st.session_state.get("anthropic_key", ""),
                 )
                 st.session_state["text_result"] = text_result
             except Exception as e:
