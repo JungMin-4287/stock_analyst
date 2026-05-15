@@ -214,8 +214,9 @@ def _extract_from_block(
                     "triple": (a, b, c)}
 
     # ② "수주잔고" 키워드 + 숫자+단위
+    # "수주잔고" 또는 "수주잔액" 키워드 바로 뒤 숫자+단위
     ctx_m = re.search(
-        r"수주\s*잔고.{0,60}?([0-9,]{3,})\s*(백만원|억원|천억원|조원|원|천원)",
+        r"수주\s*잔[고액].{0,60}?([0-9,]{3,})\s*(백만원|억원|천억원|조원|원|천원)",
         block, re.DOTALL,
     )
     if ctx_m:
@@ -237,6 +238,29 @@ def _extract_from_block(
             amounts = [n for n in nums if n >= max_v * 0.02] or nums
             return {"value": amounts[-1] * mult, "unit": local_unit,
                     "validation": "single_num", "offset_start": offset}
+
+    # 합계행 없는 단독 표 (RFHIC 등): "수주잔액" 컬럼 바로 다음 숫자
+    if local_unit:
+        janaek_m = re.search(
+            r"수주\s*잔[고액][^\n]{0,30}\n([0-9,]{5,})",
+            block,
+        )
+        if janaek_m:
+            raw = janaek_m.group(1).replace(",", "")
+            if not re.fullmatch(r"(?:19|20)\d{2}", raw):
+                try:
+                    return {"value": float(raw) * mult, "unit": local_unit,
+                            "validation": "single_num", "offset_start": offset}
+                except ValueError:
+                    pass
+        # 블록 내 가장 큰 숫자 1개 (단독 숫자 표)
+        all_nums = _extract_nums(block)
+        if all_nums:
+            max_v = max(all_nums)
+            # 단위 있고, 블록 내 수주 관련 키워드 있을 때만
+            if re.search(r"수주\s*잔[고액]", block) and max_v > 0:
+                return {"value": max_v * mult, "unit": local_unit,
+                        "validation": "single_num", "offset_start": offset}
 
     return None
 
